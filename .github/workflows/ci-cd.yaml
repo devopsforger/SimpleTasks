@@ -76,3 +76,8 @@ jobs:
           cd backend
           docker tag task-backend ${{ steps.login-ecr.outputs.registry }}/task-backend:latest
           docker push ${{ steps.login-ecr.outputs.registry }}/task-backend:latest
+
+
+# TODO: set build to happen based on path, for example build frontend only if frontend files are updated
+# TODO: setup Github oidc connection to AWS
+# TODO: optimise for tests and other factors
