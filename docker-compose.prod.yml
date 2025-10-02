@@ -14,7 +14,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-      target: development # Use development for hot-reload
+      target: production # Use production for optimized build
     ports:
       - "8000:8000"
     environment:
@@ -25,10 +25,7 @@ services:
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       JWT_ALGORITHM: ${JWT_ALGORITHM}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES}
-      DEBUG: "true" # Enable debug mode in development
-    volumes:
-      - ./backend:/app # Mount source code for hot-reload
-      - /app/.venv # Prevent overwriting virtual environment
+      DEBUG: "false" # Disable debug mode in production
     depends_on:
       - db
     healthcheck:
@@ -41,15 +38,11 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-      target: development
+      target: production
     ports:
-      - "3000:3000"
+      - "80:80"
     environment:
-      NODE_ENV: development
-      NEXT_PUBLIC_API_URL: http://localhost:8000
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
+      NODE_ENV: production
     depends_on:
       - backend
 
