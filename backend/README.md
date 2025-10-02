@@ -1,21 +1,19 @@
-Generic single-database configuration.# Task Management Backend API
+## FastAPI Backend for Task Management
 
-A production-ready, high-performance FastAPI backend for a task management application with JWT authentication, role-based access control, and async PostgreSQL support.
+A high-performance FastAPI backend with PostgreSQL, async/await architecture, and comprehensive authentication system.
 
-## Features
+## 🚀 Features
 
-- **FastAPI** with async/await architecture for high performance
-- **JWT Authentication** with secure token-based auth
-- **Role-Based Access Control (RBAC)** - Admin vs Regular users
-- **Async PostgreSQL** with SQLAlchemy 2.0+ and asyncpg
-- **Alembic Database Migrations** with async support
-- **Pydantic Validation** for robust request/response schemas
-- **Service Layer Architecture** for clean separation of concerns
-- **Production-Ready** with security best practices
+- **FastAPI** with async/await support
+- **PostgreSQL** with SQLAlchemy 2.0+ and asyncpg
+- **JWT Authentication** with token-based security
+- **Role-Based Access Control** (Admin vs Regular users)
+- **Alembic Database Migrations**
+- **Pydantic Validation** for robust API schemas
+- **Service Layer Architecture** for clean separation
 - **Docker Support** for containerized deployment
-- **UV Package Management** for fast dependency resolution
 
-## API Endpoints
+## 📋 API Endpoints
 
 ### Authentication
 
@@ -43,67 +41,7 @@ A production-ready, high-performance FastAPI backend for a task management appli
 
 - `GET /health` - Service health status
 
-## 🛠️ Tech Stack
-
-- **Framework**: FastAPI 0.104+
-- **Database**: PostgreSQL with SQLAlchemy 2.0+
-- **Async Driver**: asyncpg
-- **Authentication**: JWT with PyJWT
-- **Password Hashing**: bcrypt via passlib
-- **Migrations**: Alembic with async support
-- **Validation**: Pydantic 2.0+
-- **Package Manager**: UV
-- **API Documentation**: Auto-generated Swagger UI & ReDoc
-
-## Project Structure
-
-```
-backend/
-├── app/
-│   ├── __init__.py
-│   ├── main.py                 # FastAPI application entry point
-│   ├── config.py              # Application configuration
-│   ├── database.py            # Database connection setup
-│   ├── models/                # SQLAlchemy models
-│   │   ├── __init__.py
-│   │   ├── user.py            # User model
-│   │   └── task.py            # Task model
-│   ├── schemas/               # Pydantic schemas
-│   │   ├── __init__.py
-│   │   ├── user.py            # User request/response schemas
-│   │   └── task.py            # Task request/response schemas
-│   ├── services/              # Business logic layer
-│   │   ├── __init__.py
-│   │   ├── user_service.py    # User operations
-│   │   └── task_service.py    # Task operations
-│   ├── api/                   # API layer
-│   │   ├── __init__.py
-│   │   └── v1/
-│   │       ├── __init__.py
-│   │       ├── endpoints/     # Route handlers
-│   │       │   ├── __init__.py
-│   │       │   ├── auth.py    # Authentication routes
-│   │       │   ├── users.py   # User management routes
-│   │       │   └── tasks.py   # Task management routes
-│   │       └── deps.py        # FastAPI dependencies
-│   └── auth/                  # Authentication utilities
-│       ├── __init__.py
-│       ├── jwt.py             # JWT token handling
-│       └── security.py        # Password hashing
-├── migrations/                # Alembic migration files
-│   ├── versions/              # Generated migration scripts
-│   └── env.py                 # Alembic configuration
-├── tests/                     # Test suite
-├── scripts/
-│   └── run.sh                 # Application startup script
-├── Dockerfile                 # Container configuration
-├── pyproject.toml            # Project dependencies and metadata
-├── alembic.ini               # Alembic configuration
-├── .env.example              # Environment variables template
-└── README.md                 # This file
-```
-
-## Quick Start
+## 🛠️ Setup & Installation
 
 ### Prerequisites
 
@@ -111,58 +49,52 @@ backend/
 - PostgreSQL 13+
 - UV package manager
 
-### Installation
+### Local Development
 
-1. **Clone and setup the project**:
+1. **Navigate to backend directory**
 
-```bash
-cd backend
-cp .env.example .env
-# Edit .env with your database credentials and JWT secret
-```
+   ```bash
+   cd backend
+   ```
 
-2. **Install dependencies with UV**:
+2. **Set up environment variables**
 
-```bash
-uv sync
-```
+   ```bash
+   cp .env.example .env
+   # Edit .env with your database credentials
+   ```
 
-3. **Run database migrations**:
+3. **Install dependencies with UV**
 
-```bash
-uv run alembic upgrade head
-```
+   ```bash
+   uv sync
+   ```
 
-4. **Start the development server**:
+4. **Run database migrations**
 
-```bash
-uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
+   ```bash
+   uv run alembic upgrade head
+   ```
 
-The API will be available at `http://localhost:8000`
+5. **Start development server**
+   ```bash
+   uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+   ```
 
-### Using Scripts (Alternative)
-
-Add to `pyproject.toml`:
-
-```toml
-[project.scripts]
-dev = "uvicorn app.main:app --reload --host 0.0.0.0 --port 8000"
-start = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
-```
-
-Then run:
+### Using Docker
 
 ```bash
-uv run dev  # Development with auto-reload
-uv run start  # Production
+# Build and run with Docker Compose
+docker-compose up backend
+
+# Or build individually
+docker build -t task-management-backend .
+docker run -p 8000:8000 task-management-backend
 ```
 
-## Database Setup
+## 📊 Database Setup
 
 ### Manual PostgreSQL Setup
-
-1. **Create database and user**:
 
 ```sql
 CREATE DATABASE taskmanager;
@@ -170,45 +102,28 @@ CREATE USER taskuser WITH PASSWORD 'yourpassword';
 GRANT ALL PRIVILEGES ON DATABASE taskmanager TO taskuser;
 ```
 
-2. **Configure environment variables** in `.env`:
+### Environment Variables
 
 ```env
+# Database
 DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=taskmanager
-DB_USER=taskuser
-DB_PASSWORD=yourpassword
+DB_USER=postgres
+DB_PASSWORD=your_password
+
+# JWT
+JWT_SECRET_KEY=your_super_secret_key_here
+JWT_ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+
+# Application
+DEBUG=True
 ```
 
-### Using Docker Compose
-
-Create `docker-compose.db.yml`:
-
-```yaml
-version: "3.8"
-services:
-  postgres:
-    image: postgres:15
-    environment:
-      POSTGRES_DB: taskmanager
-      POSTGRES_USER: taskuser
-      POSTGRES_PASSWORD: yourpassword
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-volumes:
-  postgres_data:
-```
-
-Run: `docker-compose -f docker-compose.db.yml up -d`
-
-## Database Migrations
+## 🔄 Database Migrations
 
 ### Creating Migrations
-
-When you modify models, create a new migration:
 
 ```bash
 uv run alembic revision --autogenerate -m "description_of_changes"
@@ -226,138 +141,17 @@ uv run alembic upgrade head
 # Create new migration
 uv run alembic revision --autogenerate -m "message"
 
-# Apply all pending migrations
+# Apply migrations
 uv run alembic upgrade head
 
 # Rollback one migration
 uv run alembic downgrade -1
 
-# Check current migration state
+# Check current state
 uv run alembic current
-
-# Show migration history
-uv run alembic history --verbose
 ```
 
-## Authentication
-
-### User Registration
-
-```bash
-curl -X POST "http://localhost:8000/api/v1/auth/register" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "user@example.com",
-    "password": "securepassword",
-    "is_admin": false
-  }'
-```
-
-### User Login
-
-```bash
-curl -X POST "http://localhost:8000/api/v1/auth/login" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "username=user@example.com&password=securepassword"
-```
-
-### Using JWT Tokens
-
-Add the token to requests:
-
-```bash
-curl -H "Authorization: Bearer <your_jwt_token>" \
-  "http://localhost:8000/api/v1/users/me"
-```
-
-## User Roles
-
-### Regular Users
-
-- Can manage their own tasks
-- Can view their own profile
-- Cannot access other users' data
-
-### Admin Users
-
-- Can manage all tasks (create, read, update, delete any task)
-- Can manage all users (create, read, update, delete any user)
-- Have access to all API endpoints
-
-## Docker Deployment
-
-### Build and Run
-
-```bash
-docker build -t task-management-backend .
-docker run -p 8000:8000 \
-  -e DB_HOST=localhost \
-  -e DB_PASSWORD=secret \
-  -e JWT_SECRET_KEY=supersecret \
-  task-management-backend
-```
-
-### Using Docker Compose
-
-Create `docker-compose.yml`:
-
-```yaml
-version: "3.8"
-services:
-  backend:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      - DB_HOST=postgres
-      - DB_NAME=taskmanager
-      - DB_USER=taskuser
-      - DB_PASSWORD=yourpassword
-      - JWT_SECRET_KEY=your-jwt-secret-key
-    depends_on:
-      - postgres
-
-  postgres:
-    image: postgres:15
-    environment:
-      POSTGRES_DB: taskmanager
-      POSTGRES_USER: taskuser
-      POSTGRES_PASSWORD: yourpassword
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-volumes:
-  postgres_data:
-```
-
-Run: `docker-compose up -d`
-
-## Configuration
-
-### Environment Variables
-
-| Variable                      | Description       | Default       |
-| ----------------------------- | ----------------- | ------------- |
-| `DB_HOST`                     | PostgreSQL host   | `localhost`   |
-| `DB_PORT`                     | PostgreSQL port   | `5432`        |
-| `DB_NAME`                     | Database name     | `taskmanager` |
-| `DB_USER`                     | Database user     | `postgres`    |
-| `DB_PASSWORD`                 | Database password | -             |
-| `JWT_SECRET_KEY`              | JWT signing key   | -             |
-| `JWT_ALGORITHM`               | JWT algorithm     | `HS256`       |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | Token expiration  | `30`          |
-| `DEBUG`                       | Debug mode        | `False`       |
-
-### Production Configuration
-
-For production, set environment variables through:
-
-- **AWS ECS**: Use Secrets Manager and Parameter Store
-- **Kubernetes**: Use Kubernetes Secrets
-- **Docker**: Use `-e` flags or env files
-- **Traditional**: Set in deployment scripts
-
-## Testing
+## 🧪 Testing
 
 ### Running Tests
 
@@ -375,118 +169,59 @@ uv run pytest
 - `tests/test_users.py` - User management tests
 - `tests/test_tasks.py` - Task management tests
 
-## API Documentation
+## 📚 API Documentation
 
-### Auto-generated Docs
+When the server is running, access:
 
-- **Swagger UI**: `http://localhost:8000/docs`
-- **ReDoc**: `http://localhost:8000/redoc`
+- **Swagger UI**: http://localhost:8000/docs
+- **ReDoc**: http://localhost:8000/redoc
 
-### Example API Usage
+## 🐳 Docker Development
 
-1. **Register a new user**:
+### Development with Hot-Reload
 
-```python
-import requests
-
-response = requests.post(
-    "http://localhost:8000/api/v1/auth/register",
-    json={
-        "email": "admin@example.com",
-        "password": "admin123",
-        "is_admin": True
-    }
-)
+```bash
+docker-compose up backend
 ```
 
-2. **Create a task**:
+### Production Build
 
-```python
-headers = {"Authorization": f"Bearer {token}"}
-response = requests.post(
-    "http://localhost:8000/api/v1/tasks/",
-    headers=headers,
-    json={
-        "title": "Complete project",
-        "description": "Finish the backend implementation",
-        "status": "todo"
-    }
-)
+```bash
+docker build -t task-management-backend .
 ```
 
-## Security Features
+## 🔒 Security Features
 
-- **JWT Token Authentication** with expiration
-- **Password Hashing** using bcrypt
-- **SQL Injection Prevention** through SQLAlchemy
-- **CORS Protection** configurable origins
-- **Input Validation** with Pydantic schemas
-- **Role-Based Access Control** (RBAC)
-- **Environment Variable Security** no hardcoded secrets
+- JWT token authentication with expiration
+- Password hashing using bcrypt
+- SQL injection prevention via SQLAlchemy
+- Input validation with Pydantic schemas
+- Role-based access control
+- CORS protection
 
-## Deployment
+## 📁 Project Structure
 
-### AWS ECS Deployment
+```
+backend/
+├── app/
+│   ├── main.py              # FastAPI application
+│   ├── config.py            # Configuration settings
+│   ├── database.py          # Database connection
+│   ├── models/              # SQLAlchemy models
+│   ├── schemas/             # Pydantic schemas
+│   ├── services/            # Business logic layer
+│   ├── api/                 # API routes and endpoints
+│   └── auth/                # Authentication utilities
+├── migrations/              # Alembic migration files
+├── tests/                   # Test suite
+└── scripts/                 # Utility scripts
+```
 
-1. Build and push Docker image to ECR
-2. Create ECS task definition with environment variables
-3. Configure Application Load Balancer
-4. Set up Secrets Manager for sensitive data
+## 🚀 Deployment
 
-### Kubernetes Deployment
+The application is containerized and can be deployed to any container orchestration platform. The Dockerfile includes:
 
-1. Create Kubernetes deployment and service
-2. Configure secrets and config maps
-3. Set up ingress controller
-4. Configure health checks
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Database Connection Errors**
-
-   - Check PostgreSQL is running
-   - Verify credentials in `.env`
-   - Ensure database exists
-
-2. **Migration Issues**
-
-   - Run `alembic current` to check state
-   - Use `alembic history` to see migration chain
-   - Check `migrations/env.py` configuration
-
-3. **JWT Errors**
-   - Verify `JWT_SECRET_KEY` is set
-   - Check token expiration
-   - Validate token in Authorization header
-
-### Logs
-
-Enable debug logging by setting `DEBUG=True` in environment variables.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make changes with tests
-4. Run test suite
-5. Submit pull request
-
-## License
-
-This project is licensed under the MIT License.
-
-## Support
-
-For support and questions:
-
-- Check API documentation at `/docs`
-- Review migration files in `migrations/versions/`
-- Examine test cases for usage examples
-
----
-
-**Development Server**: `http://localhost:8000`  
-**API Documentation**: `http://localhost:8000/docs`  
-**Health Check**: `http://localhost:8000/health`
+- Non-root user execution
+- Health checks
+- Database connection waiting
+- Automatic migrations

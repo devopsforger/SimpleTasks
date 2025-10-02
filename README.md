@@ -1,52 +1,129 @@
 # Task Management Application
 
-A production-realistic monorepo application with a FastAPI backend and Next.js frontend, designed for testing AWS ECS (EC2 launch type) infrastructure with secure authentication, RBAC, and CI/CD.
+A production-ready, full-stack task management application built with FastAPI backend and Next.js frontend. Features user authentication, role-based access control, and real-time task management.
 
-### Structure
+## 🚀 Features
 
-- backend/: FastAPI service with PostgreSQL, Alembic migrations, JWT auth, and RBAC.
-- frontend/: Next.js static site for task and user management.
-- .github/workflows/: GitHub Actions for CI/CD with SAST and container scanning.
+- **Backend**: FastAPI with async PostgreSQL, JWT authentication, and role-based access control
+- **Frontend**: Next.js 15 with TypeScript, Tailwind CSS, and responsive design
+- **Database**: PostgreSQL with SQLAlchemy ORM and Alembic migrations
+- **Containerized**: Docker and Docker Compose for easy development and deployment
+- **Authentication**: JWT-based secure authentication system
+- **Authorization**: Admin and regular user roles with appropriate permissions
 
-### Setup
+## 🛠️ Tech Stack
 
-#### Prerequisites
+- **Backend**: FastAPI, SQLAlchemy, PostgreSQL, Alembic, Pydantic, JWT
+- **Frontend**: Next.js 15, TypeScript, Tailwind CSS, Axios
+- **Database**: PostgreSQL
+- **Containerization**: Docker, Docker Compose
+- **Package Management**: UV (Python), npm (Node.js)
 
-- Python 3.9+
-- Node.js 16+
-- Docker
-- PostgreSQL (local or via docker-compose)
+## 📁 Project Structure
 
-#### Local Development
+```
+SimpleTasks/
+├── backend/          # FastAPI backend application
+├── frontend/         # Next.js frontend application
+├── docker-compose.yml
+└── README.md
+```
 
-- Copy .env.example to .env and fill in values.
-- Run docker-compose up to start PostgreSQL, backend, and frontend dev server.
-- Backend: http://localhost:8000/docs
-- Frontend: http://localhost:3000
+## 🚀 Quick Start
 
-#### Environment Variables
+### Prerequisites
 
-- DB_HOST, DB_NAME, DB_USER, DB_PASSWORD: PostgreSQL connection.
-- JWT_SECRET_KEY: Secret for JWT signing.
-- JWT_ALGORITHM: Token algorithm (default: HS256).
-- ACCESS_TOKEN_EXPIRE_MINUTES: Token expiry (default: 30).
+- Docker and Docker Compose
+- Git
 
-### Deployment
+### Development Setup
 
-- Backend: Build Docker image (backend/Dockerfile) and deploy to ECS.
-- Frontend: Run next export and serve static files via S3 or Nginx.
-- Use AWS Secrets Manager for JWT_SECRET_KEY and Parameter Store for DB creds.
+1. **Clone the repository**
+   ```bash
+   git clone <repository-url>
+   cd SimpleTasks
+   ```
 
-### CI/CD
+2. **Set up environment variables**
+   ```bash
+   # Copy and edit the environment template
+   cp .env.example .env
+   # Edit .env with your preferred values
+   ```
 
-- GitHub Actions workflow (.github/workflows/ci-cd.yaml) includes:
-- SAST with Semgrep
-- Backend/frontend builds
-- Container scanning with Trivy
-- Push to ECR
+3. **Start the application**
+   ```bash
+   docker-compose up -d
+   ```
 
-### Testing Infrastructure
+4. **Access the applications**
+   - Frontend: http://localhost:3000
+   - Backend API: http://localhost:8000
+   - API Documentation: http://localhost:8000/docs
+   - Database: localhost:5432
 
-- Backend runs Alembic migrations on startup.
-- RBAC: Admins access all users/tasks; regular users access own data only.
-- ALB routes: /_ to frontend, /api/v1/_ to backend.
+### Default Admin Account
+
+After first setup, register a new user with admin privileges through the registration form.
+
+## 📚 Documentation
+
+- [Backend Documentation](./backend/README.md) - API details, setup, and development
+- [Frontend Documentation](./frontend/README.md) - UI components, features, and development
+
+## 🔧 Development
+
+### Running Services Individually
+
+```bash
+# Backend only
+docker-compose up backend
+
+# Frontend only  
+docker-compose up frontend
+
+# Database only
+docker-compose up db
+```
+
+### Stopping the Application
+
+```bash
+docker-compose down
+```
+
+### Viewing Logs
+
+```bash
+docker-compose logs -f
+```
+
+## 🐳 Production Deployment
+
+For production deployment, use the provided Docker Compose production configuration:
+
+```bash
+docker-compose -f docker-compose.prod.yml up -d
+```
+
+## 🔒 Security Features
+
+- JWT token-based authentication
+- Password hashing with bcrypt
+- Role-based access control
+- CORS protection
+- SQL injection prevention
+- Environment variable security
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Run tests
+5. Submit a pull request
+
+## 📄 License
+
+This project is licensed under the MIT License.
+
