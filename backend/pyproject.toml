@@ -8,9 +8,11 @@ dependencies = [
     "alembic>=1.16.5",
     "asyncpg>=0.30.0",
     "fastapi[standard]>=0.118.0",
+    "passlib>=1.7.4",
     "psycopg2-binary>=2.9.10",
     "pydantic>=2.11.9",
     "pydantic-settings>=2.11.0",
+    "python-jose>=3.5.0",
     "sqlalchemy>=2.0.43",
     "uvicorn>=0.37.0",
 ]
