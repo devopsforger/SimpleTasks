@@ -47,12 +47,18 @@ async def get_current_user(
         raise credentials_exception
 
     # Extract user ID from token
-    user_id: int = payload.get("sub")
+    user_id: str = payload.get("sub")
     if user_id is None:
         raise credentials_exception
 
+    # Convert string to integer for database query
+    try:
+        user_id_int = int(user_id)
+    except (ValueError, TypeError):
+        raise credentials_exception
+
     # Retrieve user from database
-    user = await UserService.get_by_id(db, user_id)
+    user = await UserService.get_by_id(db, user_id_int)
     if user is None:
         raise credentials_exception
 
