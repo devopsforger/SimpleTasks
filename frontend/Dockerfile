@@ -1,3 +1,4 @@
+# Multi-stage Dockerfile for Next.js frontend
 # Stage 1: Dependencies installation
 FROM node:18-alpine AS deps
 WORKDIR /app
@@ -6,26 +7,39 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --only=production --ignore-scripts
 
-# Stage 2: Build the application
+# Stage 2: Development stage (for your current docker-compose)
+FROM node:18-alpine AS development
+WORKDIR /app
+
+# Copy package files
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# Copy source code
+COPY . .
+
+# Expose port for development server
+EXPOSE 3000
+
+# Start development server
+CMD ["npm", "run", "dev"]
+
+# Stage 3: Build stage
 FROM node:18-alpine AS builder
 WORKDIR /app
 
 # Copy package files
 COPY package.json package-lock.json* ./
-RUN npm ci --only=development --ignore-scripts
+RUN npm ci --only=development
 
 # Copy source code
 COPY . .
 
-# Create .env file for build time (replace with your actual environment variables)
-ARG NEXT_PUBLIC_API_URL
-ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
-
 # Build the application
 RUN npm run build
 
-# Stage 3: Production image with static files
-FROM nginx:alpine AS runner
+# Stage 4: Production stage with static files
+FROM nginx:alpine AS production
 WORKDIR /usr/share/nginx/html
 
 # Install curl for health checks
