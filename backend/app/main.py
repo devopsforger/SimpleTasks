@@ -8,6 +8,7 @@ sets up middleware, and includes all API routers.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.v1.endpoints import auth, users, tasks
 from app.config import settings
 
 # Create FastAPI application instance
@@ -26,6 +27,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include API routers
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["authentication"])
+app.include_router(users.router, prefix="/api/v1/users", tags=["users"])
+app.include_router(tasks.router, prefix="/api/v1/tasks", tags=["tasks"])
 
 
 @app.get("/health")
