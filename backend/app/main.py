@@ -24,8 +24,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Adjust in production for security
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Include API routers

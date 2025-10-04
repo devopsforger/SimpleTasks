@@ -5,11 +5,13 @@ This module defines the authentication-related API routes including
 user registration and login.
 """
 
+from datetime import timedelta
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import timedelta
-from typing import Annotated
+
 
 from app.database import get_db
 from app.schemas.user import UserCreate

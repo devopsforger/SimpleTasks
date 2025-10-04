@@ -52,4 +52,12 @@ class Task(Base):
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
     # Relationship with owner (many tasks belong to one user)
-    owner = relationship("User", back_populates="tasks")
+    owner = relationship("User", back_populates="tasks", lazy="selectin")
+
+    def __init__(self, **kwargs):
+        # Set defaults if not provided
+        kwargs.setdefault("status", TaskStatus.TODO)
+        super().__init__(**kwargs)
+
+    def __repr__(self):
+        return f"<Task(id={self.id}, title={self.title})>"

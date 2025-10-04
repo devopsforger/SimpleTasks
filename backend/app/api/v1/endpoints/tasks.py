@@ -39,6 +39,12 @@ async def get_tasks(
     Returns:
         List[Task]: List of task objects
     """
+    if skip < 0 or limit <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid pagination parameters: skip must be >= 0 and limit must be > 0",
+        )
+
     if current_user.is_admin:
         tasks = await TaskService.get_all(db, skip=skip, limit=limit)
     else:
@@ -133,6 +139,13 @@ async def update_task(
         HTTPException: 403 if user doesn't have permission to update task
         HTTPException: 404 if task not found
     """
+    # Check if task exists first
+    task = await TaskService.get_by_id(db, task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
     # Check access permissions
     can_access = await TaskService.can_access_task(
         db, task_id, current_user.id, current_user.is_admin
@@ -177,6 +190,13 @@ async def partial_update_task(
         HTTPException: 403 if user doesn't have permission to update task
         HTTPException: 404 if task not found
     """
+    # Check if task exists first
+    task = await TaskService.get_by_id(db, task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
     # Check access permissions
     can_access = await TaskService.can_access_task(
         db, task_id, current_user.id, current_user.is_admin
@@ -219,6 +239,13 @@ async def delete_task(
         HTTPException: 403 if user doesn't have permission to delete task
         HTTPException: 404 if task not found
     """
+    # Check if task exists first
+    task = await TaskService.get_by_id(db, task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
     # Check access permissions
     can_access = await TaskService.can_access_task(
         db, task_id, current_user.id, current_user.is_admin

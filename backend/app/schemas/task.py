@@ -5,9 +5,11 @@ This module defines all Pydantic models used for task-related API operations,
 including data validation, serialization, and documentation.
 """
 
-from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional
+
+from pydantic import BaseModel, Field
+
 from app.models.task import TaskStatus
 from app.schemas.user import User
 
@@ -22,9 +24,21 @@ class TaskBase(BaseModel):
         status (TaskStatus): Current task status
     """
 
-    title: str
-    description: Optional[str] = None
+    title: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Task title must be between 1 and 200 characters",
+    )
+    description: Optional[str] = Field(
+        None,
+        max_length=1000,
+        description="Task description cannot exceed 1000 characters",
+    )
     status: Optional[TaskStatus] = TaskStatus.TODO
+
+    class Config:
+        from_attributes = True
 
 
 class TaskCreate(TaskBase):
@@ -33,6 +47,8 @@ class TaskCreate(TaskBase):
 
     Inherits all fields from TaskBase.
     """
+
+    pass
 
 
 class TaskUpdate(BaseModel):
@@ -47,8 +63,17 @@ class TaskUpdate(BaseModel):
         status (TaskStatus): New task status
     """
 
-    title: Optional[str] = None
-    description: Optional[str] = None
+    title: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=200,
+        description="Task title must be between 1 and 200 characters",
+    )
+    description: Optional[str] = Field(
+        None,
+        max_length=1000,
+        description="Task description cannot exceed 1000 characters",
+    )
     status: Optional[TaskStatus] = None
 
 
@@ -68,7 +93,7 @@ class Task(TaskBase):
     id: int
     owner_id: int
     created_at: datetime
-    owner: User
+    owner: User  # Make sure this is included
 
     class Config:
         """Pydantic configuration."""

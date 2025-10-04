@@ -5,9 +5,11 @@ This module contains the UserService class that abstracts all database operation
 related to users, providing a clean interface for the API layer.
 """
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional, Sequence
 from sqlalchemy import select
-from typing import List, Optional
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.models.user import User
 from app.schemas.user import UserCreate, UserUpdate
 from app.auth.security import get_password_hash, verify_password
@@ -47,7 +49,9 @@ class UserService:
         return result.scalar_one_or_none()
 
     @staticmethod
-    async def get_all(db: AsyncSession, skip: int = 0, limit: int = 100) -> List[User]:
+    async def get_all(
+        db: AsyncSession, skip: int = 0, limit: int = 100
+    ) -> Sequence[User]:
         """
         Retrieve all users with pagination.
 
@@ -77,6 +81,10 @@ class UserService:
         Raises:
             ValueError: If user creation fails
         """
+        existing_user = await UserService.get_by_email(db, user.email)
+        if existing_user:
+            raise ValueError("Email already exists")
+
         hashed_password = get_password_hash(user.password)
         db_user = User(
             email=user.email,
@@ -85,9 +93,18 @@ class UserService:
             is_admin=user.is_admin,
         )
         db.add(db_user)
-        await db.commit()
-        await db.refresh(db_user)
-        return db_user
+        try:
+            await db.commit()
+            await db.refresh(db_user)
+            return db_user
+        except IntegrityError as e:
+            await db.rollback()
+            if "UNIQUE constraint failed: users.email" in str(e.orig):
+                raise ValueError("Email already exists") from e
+            raise ValueError("Database error occurred") from e
+        except SQLAlchemyError as e:
+            await db.rollback()
+            raise ValueError("Database error occurred") from e
 
     @staticmethod
     async def update(
@@ -108,13 +125,27 @@ class UserService:
         if not db_user:
             return None
 
-        update_data = user_update.dict(exclude_unset=True)
+        if user_update.email and user_update.email != db_user.email:
+            existing_user = await UserService.get_by_email(db, user_update.email)
+            if existing_user:
+                raise ValueError("Email already exists")
+
+        update_data = user_update.model_dump(exclude_unset=True)
         for field, value in update_data.items():
             setattr(db_user, field, value)
 
-        await db.commit()
-        await db.refresh(db_user)
-        return db_user
+        try:
+            await db.commit()
+            await db.refresh(db_user)
+            return db_user
+        except IntegrityError as e:
+            await db.rollback()
+            if "UNIQUE constraint failed: users.email" in str(e.orig):
+                raise ValueError("Email already exists") from e
+            raise ValueError("Database error occurred") from e
+        except SQLAlchemyError as e:
+            await db.rollback()
+            raise ValueError("Database error occurred") from e
 
     @staticmethod
     async def delete(db: AsyncSession, user_id: int) -> bool:
@@ -154,6 +185,8 @@ class UserService:
         user = await UserService.get_by_email(db, email)
         if not user:
             return None
-        if not verify_password(password, user.hashed_password):
+        if not verify_password(password, user.hashed_password):  # type: ignore
+            return None
+        if not user.is_active:  # type: ignore
             return None
         return user
