@@ -5,8 +5,9 @@ This module defines all Pydantic models used for user-related API operations,
 including data validation, serialization, and documentation.
 """
 
-from pydantic import BaseModel, EmailStr
 from typing import Optional
+
+from pydantic import BaseModel, EmailStr, field_validator
 
 
 class UserBase(BaseModel):
@@ -35,6 +36,33 @@ class UserCreate(UserBase):
     """
 
     password: str
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, v: str) -> str:
+        """Validate password meets security requirements."""
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+
+        if len(v) > 128:
+            raise ValueError("Password must be less than 128 characters")
+
+        # Check for character variety
+        if not any(c.isupper() for c in v):
+            raise ValueError("Password must contain at least one uppercase letter")
+
+        if not any(c.islower() for c in v):
+            raise ValueError("Password must contain at least one lowercase letter")
+
+        if not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain at least one digit")
+
+        # Check for common passwords (simplified example)
+        common_passwords = {"123456", "password", "12345678", "qwerty", "123456789"}
+        if v.lower() in common_passwords:
+            raise ValueError("Password is too common")
+
+        return v
 
 
 class UserUpdate(BaseModel):

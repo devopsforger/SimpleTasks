@@ -5,11 +5,14 @@ This module contains the TaskService class that abstracts all database operation
 related to tasks, including authorization checks and business logic.
 """
 
+from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from typing import List, Optional
-from app.models.task import Task, TaskStatus
+from sqlalchemy.orm import selectinload
+
+from app.models.task import Task
 from app.schemas.task import TaskCreate, TaskUpdate
+from app.services.user_service import UserService
 
 
 class TaskService:
@@ -27,7 +30,9 @@ class TaskService:
         Returns:
             Optional[Task]: Task object if found, None otherwise
         """
-        result = await db.execute(select(Task).where(Task.id == task_id))
+        result = await db.execute(
+            select(Task).options(selectinload(Task.owner)).where(Task.id == task_id)
+        )
         return result.scalar_one_or_none()
 
     @staticmethod
@@ -43,7 +48,13 @@ class TaskService:
         Returns:
             List[Task]: List of task objects
         """
-        result = await db.execute(select(Task).offset(skip).limit(limit))
+        # result = await db.execute(select(Task).offset(skip).limit(limit))
+        result = await db.execute(
+            select(Task)
+            .options(selectinload(Task.owner))  # ← EAGER LOAD
+            .offset(skip)
+            .limit(limit)
+        )
         return result.scalars().all()
 
     @staticmethod
@@ -62,8 +73,15 @@ class TaskService:
         Returns:
             List[Task]: List of task objects owned by the specified user
         """
+        # result = await db.execute(
+        #     select(Task).where(Task.owner_id == owner_id).offset(skip).limit(limit)
+        # )
         result = await db.execute(
-            select(Task).where(Task.owner_id == owner_id).offset(skip).limit(limit)
+            select(Task)
+            .where(Task.owner_id == owner_id)
+            .options(selectinload(Task.owner))  # ← EAGER LOAD
+            .offset(skip)
+            .limit(limit)
         )
         return result.scalars().all()
 
@@ -80,11 +98,15 @@ class TaskService:
         Returns:
             Task: Newly created task object
         """
-        db_task = Task(**task.dict(), owner_id=owner_id)
+        db_task = Task(**task.model_dump(), owner_id=owner_id)
         db.add(db_task)
         await db.commit()
         await db.refresh(db_task)
-        return db_task
+        result = await db.execute(
+            select(Task).options(selectinload(Task.owner)).where(Task.id == db_task.id)
+        )
+
+        return result.scalar_one()
 
     @staticmethod
     async def update(
@@ -105,7 +127,7 @@ class TaskService:
         if not db_task:
             return None
 
-        update_data = task_update.dict(exclude_unset=True)
+        update_data = task_update.model_dump(exclude_unset=True)
         for field, value in update_data.items():
             setattr(db_task, field, value)
 
@@ -155,4 +177,11 @@ class TaskService:
             return True
 
         task = await TaskService.get_by_id(db, task_id)
-        return task and task.owner_id == user_id
+
+        if task is None:
+            return False
+
+        owner_exists = await UserService.get_by_id(db, task.owner_id)
+
+        # Return True only if task exists AND owner exists AND owner_id matches user_id
+        return owner_exists is not None and task.owner_id == user_id

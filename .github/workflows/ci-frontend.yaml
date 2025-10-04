@@ -1,0 +1,80 @@
+name: Frontend CI
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/ci-frontend.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "frontend/**"
+
+jobs:
+  frontend-ci:
+    name: Frontend CI Pipeline
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+          cache-dependency-path: "./frontend/package-lock.json"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run security audit
+        run: npm audit --audit-level moderate
+
+      - name: Run ESLint
+        run: npx eslint . --ext .js,.jsx,.ts,.tsx --format github
+
+      - name: Run TypeScript compiler
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npm test -- --coverage --watchAll=false
+
+      - name: Upload test coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./frontend/coverage/lcov.info
+          flags: frontend
+          name: frontend-coverage
+
+      - name: Build application
+        run: |
+          npm run build
+          npm run export
+
+      - name: Run Lighthouse CI
+        uses: treosh/lighthouse-ci-action@v12
+        with:
+          uploadArtifacts: true
+          temporaryPublicStorage: true
+          configPath: "./frontend/.github/lighthouse.config.js"
+
+      - name: Build Docker image
+        run: |
+          docker build -t task-frontend:${{ github.sha }} .
+
+      - name: Scan frontend container
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: task-frontend:${{ github.sha }}
+          format: "sarif"
+          output: "trivy-frontend-results.sarif"
+
+      - name: Upload frontend Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-frontend-results.sarif

@@ -1,0 +1,85 @@
+name: Backend CI
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "backend/**"
+      - ".github/workflows/ci-backend.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "backend/**"
+
+jobs:
+  backend-ci:
+    name: Backend CI Pipeline
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install UV
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: |
+          uv sync --dev
+
+      - name: Run security linter (Bandit)
+        run: |
+          uv run bandit -r app/ -f json -o bandit-report.json || true
+
+      - name: Run code quality (Ruff)
+        run: |
+          uv run ruff check . --output-format=github
+          uv run ruff format . --check
+
+      - name: Run type checking (MyPy)
+        run: |
+          uv run mypy app/ --ignore-missing-imports
+
+      - name: Run tests with coverage
+        run: |
+          uv run pytest tests/ -v --cov=app --cov-report=xml --cov-report=html
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./backend/coverage.xml
+          flags: backend
+          name: backend-coverage
+
+      - name: Build Docker image
+        run: |
+          docker build -t task-backend:${{ github.sha }} .
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: task-backend:${{ github.sha }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Run container structure tests
+        run: |
+          # Test that the container starts properly
+          docker run --rm -d --name test-backend -p 8000:8000 task-backend:${{ github.sha }}
+          sleep 10
+          curl -f http://localhost:8000/health || exit 1
+          docker stop test-backend

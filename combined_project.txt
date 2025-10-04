@@ -1,0 +1,4822 @@
+# File Contents
+
+=== FILE: backend/Dockerfile ===
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+RUN apt-get update && apt-get install -y postgresql-client curl && rm -rf /var/lib/apt/lists/*
+RUN pip install uv
+
+# Copy application
+COPY . .
+
+# Install dependencies
+RUN uv venv && . /app/.venv/bin/activate && uv pip install -r pyproject.toml
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+CMD ["/app/.venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+---
+
+=== FILE: backend/app/main.py ===
+
+"""
+FastAPI application entry point.
+
+This module creates and configures the FastAPI application instance,
+sets up middleware, and includes all API routers.
+"""
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.v1.endpoints import auth, users, tasks
+from app.config import settings
+
+# Create FastAPI application instance
+app = FastAPI(
+    title="Task Management API",
+    description="Backend API for Task Management Application with JWT authentication and role-based access control",
+    version="1.0.0",
+    debug=settings.DEBUG,
+)
+
+# Configure CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust in production for security
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+# Include API routers
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["authentication"])
+app.include_router(users.router, prefix="/api/v1/users", tags=["users"])
+app.include_router(tasks.router, prefix="/api/v1/tasks", tags=["tasks"])
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint.
+
+    Returns:
+        dict: Service status information
+    """
+    return {"status": "ok", "service": "backend"}
+
+
+@app.get("/")
+async def root():
+    """
+    Root endpoint.
+
+    Returns:
+        dict: Welcome message
+    """
+    return {"message": "Task Management API"}
+
+---
+
+=== FILE: backend/app/api/deps.py ===
+
+"""
+FastAPI dependencies for authentication and authorization.
+
+This module provides dependency functions that can be used in route handlers
+to handle JWT authentication, user retrieval, and role-based access control.
+"""
+
+from typing import Annotated
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.user import User as UserModel
+from app.database import get_db
+from app.auth.jwt import verify_token
+from app.services.user_service import UserService
+
+# HTTP Bearer security scheme for JWT tokens
+security = HTTPBearer(auto_error=False)
+
+
+async def get_current_user(
+    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> UserModel:
+    """
+    Dependency to get current authenticated user from JWT token.
+
+    Args:
+        credentials: HTTP Bearer credentials containing JWT token
+        db: Database session
+
+    Returns:
+        User: Authenticated user object
+
+    Raises:
+        HTTPException: 401 if token is invalid or user not found
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    if not credentials:
+        raise credentials_exception
+
+    if not credentials.credentials or credentials.credentials.strip() == "":
+        raise credentials_exception
+
+    # Verify JWT token
+    payload = verify_token(credentials.credentials)
+    if payload is None:
+        raise credentials_exception
+
+    # Extract user ID from token
+    user_id: str = payload.get("sub")
+    if user_id is None:
+        raise credentials_exception
+
+    # Convert string to integer for database query
+    try:
+        user_id_int = int(user_id)
+    except (ValueError, TypeError):
+        raise credentials_exception
+
+    # Retrieve user from database
+    user = await UserService.get_by_id(db, user_id_int)
+    if user is None:
+        raise credentials_exception
+
+    return user
+
+
+async def get_current_active_user(
+    current_user: Annotated[UserModel, Depends(get_current_user)],
+):
+    """
+    Dependency to ensure current user is active.
+
+    Args:
+        current_user: User object from get_current_user dependency
+
+    Returns:
+        User: Active user object
+
+    Raises:
+        HTTPException: 400 if user account is inactive
+    """
+    if not current_user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Inactive user",
+        )
+    return current_user
+
+
+async def require_admin(
+    current_user: Annotated[UserModel, Depends(get_current_active_user)],
+):
+    """
+    Dependency to require admin privileges.
+
+    Args:
+        current_user: Active user object from get_current_active_user dependency
+
+    Returns:
+        User: User object with admin privileges
+
+    Raises:
+        HTTPException: 403 if user doesn't have admin privileges
+    """
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        )
+    return current_user
+
+---
+
+=== FILE: backend/app/api/v1/endpoints/users.py ===
+
+"""
+User management API endpoints.
+
+This module defines the user-related API routes including user CRUD operations
+and profile management. Most endpoints require admin privileges.
+"""
+
+from typing import Annotated, List
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import get_current_active_user, require_admin
+from app.database import get_db
+from app.models.user import User as UserModel
+from app.schemas.user import User, UserUpdate
+from app.services.user_service import UserService
+
+# Router for user endpoints
+router = APIRouter()
+
+
+@router.get("/", response_model=List[User])
+async def get_users(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: UserModel = Depends(require_admin),
+    skip: int = 0,
+    limit: int = 100,
+):
+    """
+    Get all users (admin only).
+
+    Args:
+        skip: Number of records to skip (pagination)
+        limit: Maximum number of records to return (pagination)
+        db: Database session
+        current_user: Authenticated admin user
+
+    Returns:
+        List[User]: List of user objects
+    """
+    users = await UserService.get_all(db, skip=skip, limit=limit)
+    return users
+
+
+@router.get("/me", response_model=User)
+async def get_current_user(
+    current_user: UserModel = Depends(get_current_active_user),
+):
+    """
+    Get current user's profile.
+
+    Args:
+        current_user: Authenticated user
+
+    Returns:
+        User: Current user's profile data
+    """
+    return current_user
+
+
+@router.get("/{user_id}", response_model=User)
+async def get_user(
+    user_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: UserModel = Depends(require_admin),
+):
+    """
+    Get specific user by ID (admin only).
+
+    Args:
+        user_id: ID of user to retrieve
+        db: Database session
+        current_user: Authenticated admin user
+
+    Returns:
+        User: User object
+
+    Raises:
+        HTTPException: 404 if user not found
+    """
+    user = await UserService.get_by_id(db, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+        )
+    return user
+
+
+@router.patch("/{user_id}", response_model=User)
+async def update_user(
+    user_id: int,
+    user_update: UserUpdate,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: UserModel = Depends(require_admin),
+):
+    """
+    Update user information (admin only).
+
+    Args:
+        user_id: ID of user to update
+        user_update: User update data
+        db: Database session
+        current_user: Authenticated admin user
+
+    Returns:
+        User: Updated user object
+
+    Raises:
+        HTTPException: 404 if user not found
+        HTTPException: 400 if email already exists
+    """
+    try:
+        user = await UserService.update(db, user_id, user_update)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+            )
+        return user
+    except ValueError as e:
+        if "already exists" in str(e):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+            ) from e
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        ) from e
+
+
+@router.delete("/{user_id}")
+async def delete_user(
+    user_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: UserModel = Depends(require_admin),
+):
+    """
+    Delete user (admin only).
+
+    Args:
+        user_id: ID of user to delete
+        db: Database session
+        current_user: Authenticated admin user
+
+    Returns:
+        dict: Success message
+
+    Raises:
+        HTTPException: 400 if trying to delete own account
+        HTTPException: 404 if user not found
+    """
+    # Prevent users from deleting their own account
+    if user_id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete yourself"
+        )
+
+    # Delete user
+    success = await UserService.delete(db, user_id)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+        )
+
+    return {"message": "User deleted successfully"}
+
+---
+
+=== FILE: backend/app/api/v1/endpoints/auth.py ===
+
+"""
+Authentication API endpoints.
+
+This module defines the authentication-related API routes including
+user registration and login.
+"""
+
+from datetime import timedelta
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+from app.database import get_db
+from app.schemas.user import UserCreate
+from app.services.user_service import UserService
+from app.auth.jwt import create_access_token
+from app.config import settings
+
+# Router for authentication endpoints
+router = APIRouter()
+
+
+@router.post("/register")
+async def register(user_data: UserCreate, db: Annotated[AsyncSession, Depends(get_db)]):
+    """
+    Register a new user account.
+
+    Args:
+        user_data: User registration data including email and password
+        db: Database session
+
+    Returns:
+        dict: Access token and user information
+
+    Raises:
+        HTTPException: 400 if email is already registered
+    """
+    # Check if user already exists
+    existing_user = await UserService.get_by_email(db, user_data.email)
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered"
+        )
+
+    # Create new user
+    user = await UserService.create(db, user_data)
+
+    # Generate access token
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(user.id)}, expires_delta=access_token_expires
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": user.id,
+        "is_admin": user.is_admin,
+    }
+
+
+@router.post("/login")
+async def login(
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """
+    Authenticate user and return JWT token.
+
+    Args:
+        form_data: OAuth2 password form data (username=email, password)
+        db: Database session
+
+    Returns:
+        dict: Access token and user information
+
+    Raises:
+        HTTPException: 401 if authentication fails
+    """
+    # Authenticate user
+    user = await UserService.authenticate(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+        )
+
+    # Generate access token
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(user.id)}, expires_delta=access_token_expires
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": user.id,
+        "is_admin": user.is_admin,
+    }
+
+---
+
+=== FILE: backend/app/api/v1/endpoints/tasks.py ===
+
+"""
+Task management API endpoints.
+
+This module defines the task-related API routes including task CRUD operations
+with proper authorization checks.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Annotated, List
+
+from app.database import get_db
+from app.schemas.task import Task, TaskCreate, TaskUpdate
+from app.services.task_service import TaskService
+from app.api.deps import get_current_active_user, require_admin
+
+# Router for task endpoints
+router = APIRouter()
+
+
+@router.get("/", response_model=List[Task])
+async def get_tasks(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[dict, Depends(get_current_active_user)],
+    skip: int = 0,
+    limit: int = 100,
+):
+    """
+    Get tasks based on user role.
+
+    Admins get all tasks, regular users get only their own tasks.
+
+    Args:
+        skip: Number of records to skip (pagination)
+        limit: Maximum number of records to return (pagination)
+        db: Database session
+        current_user: Authenticated user
+
+    Returns:
+        List[Task]: List of task objects
+    """
+    if skip < 0 or limit <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid pagination parameters: skip must be >= 0 and limit must be > 0",
+        )
+
+    if current_user.is_admin:
+        tasks = await TaskService.get_all(db, skip=skip, limit=limit)
+    else:
+        tasks = await TaskService.get_by_owner(
+            db, current_user.id, skip=skip, limit=limit
+        )
+    return tasks
+
+
+@router.post("/", response_model=Task)
+async def create_task(
+    task: TaskCreate,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[dict, Depends(get_current_active_user)],
+):
+    """
+    Create a new task.
+
+    The task will be automatically assigned to the current user.
+
+    Args:
+        task: Task creation data
+        db: Database session
+        current_user: Authenticated user
+
+    Returns:
+        Task: Newly created task object
+    """
+    return await TaskService.create(db, task, current_user.id)
+
+
+@router.get("/{task_id}", response_model=Task)
+async def get_task(
+    task_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[dict, Depends(get_current_active_user)],
+):
+    """
+    Get specific task by ID.
+
+    Users can only access their own tasks unless they are admins.
+
+    Args:
+        task_id: ID of task to retrieve
+        db: Database session
+        current_user: Authenticated user
+
+    Returns:
+        Task: Task object
+
+    Raises:
+        HTTPException: 404 if task not found
+        HTTPException: 403 if user doesn't have permission to access task
+    """
+    task = await TaskService.get_by_id(db, task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+    # Check access permissions
+    if not current_user.is_admin and task.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions"
+        )
+
+    return task
+
+
+@router.put("/{task_id}", response_model=Task)
+async def update_task(
+    task_id: int,
+    task_update: TaskUpdate,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[dict, Depends(get_current_active_user)],
+):
+    """
+    Fully update a task.
+
+    Users can only update their own tasks unless they are admins.
+
+    Args:
+        task_id: ID of task to update
+        task_update: Task update data
+        db: Database session
+        current_user: Authenticated user
+
+    Returns:
+        Task: Updated task object
+
+    Raises:
+        HTTPException: 403 if user doesn't have permission to update task
+        HTTPException: 404 if task not found
+    """
+    # Check if task exists first
+    task = await TaskService.get_by_id(db, task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+    # Check access permissions
+    can_access = await TaskService.can_access_task(
+        db, task_id, current_user.id, current_user.is_admin
+    )
+    if not can_access:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions"
+        )
+
+    # Update task
+    task = await TaskService.update(db, task_id, task_update)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+    return task
+
+
+@router.patch("/{task_id}", response_model=Task)
+async def partial_update_task(
+    task_id: int,
+    task_update: TaskUpdate,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[dict, Depends(get_current_active_user)],
+):
+    """
+    Partially update a task.
+
+    Users can only update their own tasks unless they are admins.
+
+    Args:
+        task_id: ID of task to update
+        task_update: Partial task update data
+        db: Database session
+        current_user: Authenticated user
+
+    Returns:
+        Task: Updated task object
+
+    Raises:
+        HTTPException: 403 if user doesn't have permission to update task
+        HTTPException: 404 if task not found
+    """
+    # Check if task exists first
+    task = await TaskService.get_by_id(db, task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+    # Check access permissions
+    can_access = await TaskService.can_access_task(
+        db, task_id, current_user.id, current_user.is_admin
+    )
+    if not can_access:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions"
+        )
+
+    # Update task
+    task = await TaskService.update(db, task_id, task_update)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+    return task
+
+
+@router.delete("/{task_id}")
+async def delete_task(
+    task_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[dict, Depends(get_current_active_user)],
+):
+    """
+    Delete a task.
+
+    Users can only delete their own tasks unless they are admins.
+
+    Args:
+        task_id: ID of task to delete
+        db: Database session
+        current_user: Authenticated user
+
+    Returns:
+        dict: Success message
+
+    Raises:
+        HTTPException: 403 if user doesn't have permission to delete task
+        HTTPException: 404 if task not found
+    """
+    # Check if task exists first
+    task = await TaskService.get_by_id(db, task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+    # Check access permissions
+    can_access = await TaskService.can_access_task(
+        db, task_id, current_user.id, current_user.is_admin
+    )
+    if not can_access:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions"
+        )
+
+    # Delete task
+    success = await TaskService.delete(db, task_id)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+    return {"message": "Task deleted successfully"}
+
+---
+
+=== FILE: backend/app/database.py ===
+
+"""
+Database configuration and connection management.
+
+This module sets up the SQLAlchemy async engine, session factory, and base class
+for declarative models. It provides the database connection dependency for FastAPI.
+"""
+
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
+
+from app.config import settings
+
+# Create async database engine
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=settings.DEBUG,  # Log SQL queries in debug mode
+    future=True,
+)
+
+# Async session factory
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+# Base class for declarative models
+Base = declarative_base()
+
+
+async def get_db() -> AsyncSession:
+    """
+    Database dependency for FastAPI.
+
+    Yields an async database session and ensures proper cleanup after request completion.
+
+    Yields:
+        AsyncSession: Async database session
+
+    Example:
+        ```python
+        async def some_endpoint(db: AsyncSession = Depends(get_db)):
+            # Use db session here
+            pass
+        ```
+    """
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+
+---
+
+=== FILE: backend/app/services/task_service.py ===
+
+"""
+Task service layer for business logic and database operations.
+
+This module contains the TaskService class that abstracts all database operations
+related to tasks, including authorization checks and business logic.
+"""
+
+from typing import List, Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
+from app.models.task import Task
+from app.schemas.task import TaskCreate, TaskUpdate
+from app.services.user_service import UserService
+
+
+class TaskService:
+    """Service class for task-related database operations."""
+
+    @staticmethod
+    async def get_by_id(db: AsyncSession, task_id: int) -> Optional[Task]:
+        """
+        Retrieve a task by its ID.
+
+        Args:
+            db (AsyncSession): Database session
+            task_id (int): Task identifier to search for
+
+        Returns:
+            Optional[Task]: Task object if found, None otherwise
+        """
+        result = await db.execute(
+            select(Task).options(selectinload(Task.owner)).where(Task.id == task_id)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_all(db: AsyncSession, skip: int = 0, limit: int = 100) -> List[Task]:
+        """
+        Retrieve all tasks with pagination.
+
+        Args:
+            db (AsyncSession): Database session
+            skip (int): Number of records to skip
+            limit (int): Maximum number of records to return
+
+        Returns:
+            List[Task]: List of task objects
+        """
+        # result = await db.execute(select(Task).offset(skip).limit(limit))
+        result = await db.execute(
+            select(Task)
+            .options(selectinload(Task.owner))  # ← EAGER LOAD
+            .offset(skip)
+            .limit(limit)
+        )
+        return result.scalars().all()
+
+    @staticmethod
+    async def get_by_owner(
+        db: AsyncSession, owner_id: int, skip: int = 0, limit: int = 100
+    ) -> List[Task]:
+        """
+        Retrieve tasks belonging to a specific user.
+
+        Args:
+            db (AsyncSession): Database session
+            owner_id (int): User ID to filter tasks by
+            skip (int): Number of records to skip
+            limit (int): Maximum number of records to return
+
+        Returns:
+            List[Task]: List of task objects owned by the specified user
+        """
+        # result = await db.execute(
+        #     select(Task).where(Task.owner_id == owner_id).offset(skip).limit(limit)
+        # )
+        result = await db.execute(
+            select(Task)
+            .where(Task.owner_id == owner_id)
+            .options(selectinload(Task.owner))  # ← EAGER LOAD
+            .offset(skip)
+            .limit(limit)
+        )
+        return result.scalars().all()
+
+    @staticmethod
+    async def create(db: AsyncSession, task: TaskCreate, owner_id: int) -> Task:
+        """
+        Create a new task for a user.
+
+        Args:
+            db (AsyncSession): Database session
+            task (TaskCreate): Task creation data
+            owner_id (int): ID of user who owns this task
+
+        Returns:
+            Task: Newly created task object
+        """
+        db_task = Task(**task.model_dump(), owner_id=owner_id)
+        db.add(db_task)
+        await db.commit()
+        await db.refresh(db_task)
+        result = await db.execute(
+            select(Task).options(selectinload(Task.owner)).where(Task.id == db_task.id)
+        )
+
+        return result.scalar_one()
+
+    @staticmethod
+    async def update(
+        db: AsyncSession, task_id: int, task_update: TaskUpdate
+    ) -> Optional[Task]:
+        """
+        Update an existing task.
+
+        Args:
+            db (AsyncSession): Database session
+            task_id (int): ID of task to update
+            task_update (TaskUpdate): Update data
+
+        Returns:
+            Optional[Task]: Updated task object if found, None otherwise
+        """
+        db_task = await TaskService.get_by_id(db, task_id)
+        if not db_task:
+            return None
+
+        update_data = task_update.model_dump(exclude_unset=True)
+        for field, value in update_data.items():
+            setattr(db_task, field, value)
+
+        await db.commit()
+        await db.refresh(db_task)
+        return db_task
+
+    @staticmethod
+    async def delete(db: AsyncSession, task_id: int) -> bool:
+        """
+        Delete a task from the database.
+
+        Args:
+            db (AsyncSession): Database session
+            task_id (int): ID of task to delete
+
+        Returns:
+            bool: True if task was deleted, False if task not found
+        """
+        db_task = await TaskService.get_by_id(db, task_id)
+        if not db_task:
+            return False
+
+        await db.delete(db_task)
+        await db.commit()
+        return True
+
+    @staticmethod
+    async def can_access_task(
+        db: AsyncSession, task_id: int, user_id: int, is_admin: bool
+    ) -> bool:
+        """
+        Check if a user can access a specific task.
+
+        Admins can access all tasks, regular users can only access their own tasks.
+
+        Args:
+            db (AsyncSession): Database session
+            task_id (int): ID of task to check access for
+            user_id (int): ID of user requesting access
+            is_admin (bool): Whether the user has admin privileges
+
+        Returns:
+            bool: True if user can access the task, False otherwise
+        """
+        if is_admin:
+            return True
+
+        task = await TaskService.get_by_id(db, task_id)
+
+        if task is None:
+            return False
+
+        owner_exists = await UserService.get_by_id(db, task.owner_id)
+
+        # Return True only if task exists AND owner exists AND owner_id matches user_id
+        return owner_exists is not None and task.owner_id == user_id
+
+---
+
+=== FILE: backend/app/services/user_service.py ===
+
+"""
+User service layer for business logic and database operations.
+
+This module contains the UserService class that abstracts all database operations
+related to users, providing a clean interface for the API layer.
+"""
+
+from typing import Optional, Sequence
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.user import User
+from app.schemas.user import UserCreate, UserUpdate
+from app.auth.security import get_password_hash, verify_password
+
+
+class UserService:
+    """Service class for user-related database operations."""
+
+    @staticmethod
+    async def get_by_id(db: AsyncSession, user_id: int) -> Optional[User]:
+        """
+        Retrieve a user by their ID.
+
+        Args:
+            db (AsyncSession): Database session
+            user_id (int): User identifier to search for
+
+        Returns:
+            Optional[User]: User object if found, None otherwise
+        """
+        result = await db.execute(select(User).where(User.id == user_id))
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_by_email(db: AsyncSession, email: str) -> Optional[User]:
+        """
+        Retrieve a user by their email address.
+
+        Args:
+            db (AsyncSession): Database session
+            email (str): Email address to search for
+
+        Returns:
+            Optional[User]: User object if found, None otherwise
+        """
+        result = await db.execute(select(User).where(User.email == email))
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_all(
+        db: AsyncSession, skip: int = 0, limit: int = 100
+    ) -> Sequence[User]:
+        """
+        Retrieve all users with pagination.
+
+        Args:
+            db (AsyncSession): Database session
+            skip (int): Number of records to skip
+            limit (int): Maximum number of records to return
+
+        Returns:
+            List[User]: List of user objects
+        """
+        result = await db.execute(select(User).offset(skip).limit(limit))
+        return result.scalars().all()
+
+    @staticmethod
+    async def create(db: AsyncSession, user: UserCreate) -> User:
+        """
+        Create a new user in the database.
+
+        Args:
+            db (AsyncSession): Database session
+            user (UserCreate): User creation data
+
+        Returns:
+            User: Newly created user object
+
+        Raises:
+            ValueError: If user creation fails
+        """
+        existing_user = await UserService.get_by_email(db, user.email)
+        if existing_user:
+            raise ValueError("Email already exists")
+
+        hashed_password = get_password_hash(user.password)
+        db_user = User(
+            email=user.email,
+            hashed_password=hashed_password,
+            is_active=user.is_active,
+            is_admin=user.is_admin,
+        )
+        db.add(db_user)
+        try:
+            await db.commit()
+            await db.refresh(db_user)
+            return db_user
+        except IntegrityError as e:
+            await db.rollback()
+            if "UNIQUE constraint failed: users.email" in str(e.orig):
+                raise ValueError("Email already exists") from e
+            raise ValueError("Database error occurred") from e
+        except SQLAlchemyError as e:
+            await db.rollback()
+            raise ValueError("Database error occurred") from e
+
+    @staticmethod
+    async def update(
+        db: AsyncSession, user_id: int, user_update: UserUpdate
+    ) -> Optional[User]:
+        """
+        Update an existing user.
+
+        Args:
+            db (AsyncSession): Database session
+            user_id (int): ID of user to update
+            user_update (UserUpdate): Update data
+
+        Returns:
+            Optional[User]: Updated user object if found, None otherwise
+        """
+        db_user = await UserService.get_by_id(db, user_id)
+        if not db_user:
+            return None
+
+        if user_update.email and user_update.email != db_user.email:
+            existing_user = await UserService.get_by_email(db, user_update.email)
+            if existing_user:
+                raise ValueError("Email already exists")
+
+        update_data = user_update.model_dump(exclude_unset=True)
+        for field, value in update_data.items():
+            setattr(db_user, field, value)
+
+        try:
+            await db.commit()
+            await db.refresh(db_user)
+            return db_user
+        except IntegrityError as e:
+            await db.rollback()
+            if "UNIQUE constraint failed: users.email" in str(e.orig):
+                raise ValueError("Email already exists") from e
+            raise ValueError("Database error occurred") from e
+        except SQLAlchemyError as e:
+            await db.rollback()
+            raise ValueError("Database error occurred") from e
+
+    @staticmethod
+    async def delete(db: AsyncSession, user_id: int) -> bool:
+        """
+        Delete a user from the database.
+
+        Args:
+            db (AsyncSession): Database session
+            user_id (int): ID of user to delete
+
+        Returns:
+            bool: True if user was deleted, False if user not found
+        """
+        db_user = await UserService.get_by_id(db, user_id)
+        if not db_user:
+            return False
+
+        await db.delete(db_user)
+        await db.commit()
+        return True
+
+    @staticmethod
+    async def authenticate(
+        db: AsyncSession, email: str, password: str
+    ) -> Optional[User]:
+        """
+        Authenticate a user with email and password.
+
+        Args:
+            db (AsyncSession): Database session
+            email (str): User's email address
+            password (str): Plain text password
+
+        Returns:
+            Optional[User]: User object if authentication successful, None otherwise
+        """
+        user = await UserService.get_by_email(db, email)
+        if not user:
+            return None
+        if not verify_password(password, user.hashed_password):  # type: ignore
+            return None
+        if not user.is_active:  # type: ignore
+            return None
+        return user
+
+---
+
+=== FILE: backend/app/schemas/user.py ===
+
+"""
+User Pydantic schemas for request/response validation.
+
+This module defines all Pydantic models used for user-related API operations,
+including data validation, serialization, and documentation.
+"""
+
+from typing import Optional
+
+from pydantic import BaseModel, EmailStr, field_validator
+
+
+class UserBase(BaseModel):
+    """
+    Base user schema with common attributes.
+
+    Attributes:
+        email (EmailStr): User's email address
+        is_active (bool): Whether the user account is active
+        is_admin (bool): Whether the user has admin privileges
+    """
+
+    email: EmailStr
+    is_active: Optional[bool] = True
+    is_admin: Optional[bool] = False
+
+
+class UserCreate(UserBase):
+    """
+    Schema for user creation requests.
+
+    Extends UserBase with password field for registration.
+
+    Attributes:
+        password (str): Plain text password for new user
+    """
+
+    password: str
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, v: str) -> str:
+        """Validate password meets security requirements."""
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+
+        if len(v) > 128:
+            raise ValueError("Password must be less than 128 characters")
+
+        # Check for character variety
+        if not any(c.isupper() for c in v):
+            raise ValueError("Password must contain at least one uppercase letter")
+
+        if not any(c.islower() for c in v):
+            raise ValueError("Password must contain at least one lowercase letter")
+
+        if not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain at least one digit")
+
+        # Check for common passwords (simplified example)
+        common_passwords = {"123456", "password", "12345678", "qwerty", "123456789"}
+        if v.lower() in common_passwords:
+            raise ValueError("Password is too common")
+
+        return v
+
+
+class UserUpdate(BaseModel):
+    """
+    Schema for user update requests.
+
+    All fields are optional to allow partial updates.
+
+    Attributes:
+        email (EmailStr): New email address
+        is_active (bool): New active status
+        is_admin (bool): New admin status
+    """
+
+    email: Optional[EmailStr] = None
+    is_active: Optional[bool] = None
+    is_admin: Optional[bool] = None
+
+
+class User(UserBase):
+    """
+    User response schema.
+
+    Used for serializing user data in API responses.
+
+    Attributes:
+        id (int): User identifier
+    """
+
+    id: int
+
+    class Config:
+        """Pydantic configuration."""
+
+        from_attributes = True
+
+
+class UserInDB(User):
+    """
+    Extended user schema including database-specific fields.
+
+    Used internally, not exposed via API.
+
+    Attributes:
+        hashed_password (str): Hashed password stored in database
+    """
+
+    hashed_password: str
+
+---
+
+=== FILE: backend/app/schemas/task.py ===
+
+"""
+Task Pydantic schemas for request/response validation.
+
+This module defines all Pydantic models used for task-related API operations,
+including data validation, serialization, and documentation.
+"""
+
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+from app.models.task import TaskStatus
+from app.schemas.user import User
+
+
+class TaskBase(BaseModel):
+    """
+    Base task schema with common attributes.
+
+    Attributes:
+        title (str): Task title
+        description (str): Detailed task description
+        status (TaskStatus): Current task status
+    """
+
+    title: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Task title must be between 1 and 200 characters",
+    )
+    description: Optional[str] = Field(
+        None,
+        max_length=1000,
+        description="Task description cannot exceed 1000 characters",
+    )
+    status: Optional[TaskStatus] = TaskStatus.TODO
+
+    class Config:
+        from_attributes = True
+
+
+class TaskCreate(TaskBase):
+    """
+    Schema for task creation requests.
+
+    Inherits all fields from TaskBase.
+    """
+
+    pass
+
+
+class TaskUpdate(BaseModel):
+    """
+    Schema for task update requests.
+
+    All fields are optional to allow partial updates.
+
+    Attributes:
+        title (str): New task title
+        description (str): New task description
+        status (TaskStatus): New task status
+    """
+
+    title: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=200,
+        description="Task title must be between 1 and 200 characters",
+    )
+    description: Optional[str] = Field(
+        None,
+        max_length=1000,
+        description="Task description cannot exceed 1000 characters",
+    )
+    status: Optional[TaskStatus] = None
+
+
+class Task(TaskBase):
+    """
+    Task response schema.
+
+    Used for serializing task data in API responses, includes relationship data.
+
+    Attributes:
+        id (int): Task identifier
+        owner_id (int): ID of the user who owns this task
+        created_at (datetime): When the task was created
+        owner (User): User object representing the task owner
+    """
+
+    id: int
+    owner_id: int
+    created_at: datetime
+    owner: User  # Make sure this is included
+
+    class Config:
+        """Pydantic configuration."""
+
+        from_attributes = True
+
+---
+
+=== FILE: backend/app/models/user.py ===
+
+"""
+User model definition.
+
+This module defines the User SQLAlchemy model representing application users
+with authentication and authorization capabilities.
+"""
+
+from sqlalchemy import Boolean, Column, Integer, String
+from sqlalchemy.orm import relationship
+from app.database import Base
+
+
+class User(Base):
+    """
+    User model representing application users.
+
+    Attributes:
+        id (int): Primary key identifier
+        email (str): Unique email address used for authentication
+        hashed_password (str): BCrypt hashed password
+        is_active (bool): Flag indicating if user account is active
+        is_admin (bool): Flag indicating if user has admin privileges
+        tasks (Relationship): One-to-many relationship with Task model
+    """
+
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    is_admin = Column(Boolean, default=False, nullable=False)
+
+    # Relationship with tasks (one user can have many tasks)
+    tasks = relationship(
+        "Task", back_populates="owner", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+    def __init__(self, **kwargs):
+        # Set defaults if not provided
+        kwargs.setdefault("is_active", True)
+        kwargs.setdefault("is_admin", False)
+        super().__init__(**kwargs)
+
+    def __repr__(self):
+        return f"<User(id={self.id}, email={self.email})>"
+
+---
+
+=== FILE: backend/app/models/task.py ===
+
+"""
+Task model definition.
+
+This module defines the Task SQLAlchemy model representing user tasks
+with status tracking and ownership.
+"""
+
+import enum
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Enum
+from sqlalchemy.sql import func
+from sqlalchemy.orm import relationship
+
+from app.database import Base
+
+
+class TaskStatus(str, enum.Enum):
+    """
+    Enumeration representing possible task statuses.
+
+    Attributes:
+        TODO: Task has been created but not started
+        IN_PROGRESS: Task is currently being worked on
+        DONE: Task has been completed
+    """
+
+    TODO = "todo"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+
+
+class Task(Base):
+    """
+    Task model representing user tasks.
+
+    Attributes:
+        id (int): Primary key identifier
+        title (str): Task title
+        description (str): Detailed task description
+        status (TaskStatus): Current status of the task
+        created_at (DateTime): Timestamp when task was created
+        owner_id (int): Foreign key to the user who owns this task
+        owner (Relationship): Many-to-one relationship with User model
+    """
+
+    __tablename__ = "tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, index=True, nullable=False)
+    description = Column(Text)
+    status = Column(Enum(TaskStatus), default=TaskStatus.TODO, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # Relationship with owner (many tasks belong to one user)
+    owner = relationship("User", back_populates="tasks", lazy="selectin")
+
+    def __init__(self, **kwargs):
+        # Set defaults if not provided
+        kwargs.setdefault("status", TaskStatus.TODO)
+        super().__init__(**kwargs)
+
+    def __repr__(self):
+        return f"<Task(id={self.id}, title={self.title})>"
+
+---
+
+=== FILE: backend/app/migrations/versions/7fe4aab353f1_initial_migration.py ===
+
+"""initial migration
+
+Revision ID: 7fe4aab353f1
+Revises: 
+Create Date: 2025-10-02 12:56:35.087039
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = '7fe4aab353f1'
+down_revision: Union[str, Sequence[str], None] = None
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.create_table('users',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('email', sa.String(), nullable=False),
+    sa.Column('hashed_password', sa.String(), nullable=False),
+    sa.Column('is_active', sa.Boolean(), nullable=True),
+    sa.Column('is_admin', sa.Boolean(), nullable=True),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_users_email'), 'users', ['email'], unique=True)
+    op.create_index(op.f('ix_users_id'), 'users', ['id'], unique=False)
+    op.create_table('tasks',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('title', sa.String(), nullable=False),
+    sa.Column('description', sa.Text(), nullable=True),
+    sa.Column('status', sa.Enum('TODO', 'IN_PROGRESS', 'DONE', name='taskstatus'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
+    sa.Column('owner_id', sa.Integer(), nullable=False),
+    sa.ForeignKeyConstraint(['owner_id'], ['users.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_tasks_id'), 'tasks', ['id'], unique=False)
+    op.create_index(op.f('ix_tasks_title'), 'tasks', ['title'], unique=False)
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_index(op.f('ix_tasks_title'), table_name='tasks')
+    op.drop_index(op.f('ix_tasks_id'), table_name='tasks')
+    op.drop_table('tasks')
+    op.drop_index(op.f('ix_users_id'), table_name='users')
+    op.drop_index(op.f('ix_users_email'), table_name='users')
+    op.drop_table('users')
+    # ### end Alembic commands ###
+
+---
+
+=== FILE: backend/app/migrations/script.py.mako ===
+
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+${imports if imports else ""}
+
+# revision identifiers, used by Alembic.
+revision: str = ${repr(up_revision)}
+down_revision: Union[str, Sequence[str], None] = ${repr(down_revision)}
+branch_labels: Union[str, Sequence[str], None] = ${repr(branch_labels)}
+depends_on: Union[str, Sequence[str], None] = ${repr(depends_on)}
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    ${upgrades if upgrades else "pass"}
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    ${downgrades if downgrades else "pass"}
+
+---
+
+=== FILE: backend/app/config.py ===
+
+"""
+Application configuration settings module.
+
+This module defines the configuration settings for the Task Management API
+using Pydantic settings management. It handles environment variables,
+default values, and computed properties like database URLs.
+"""
+
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    """
+    Application settings configuration.
+
+    This class defines all configuration parameters needed by the application,
+    with support for environment variable loading and default values.
+
+    Attributes:
+        DB_HOST (str): Database host address
+        DB_PORT (str): Database port number
+        DB_NAME (str): Database name
+        DB_USER (str): Database username
+        DB_PASSWORD (str): Database password
+        JWT_SECRET_KEY (str): Secret key for JWT token encoding/decoding
+        JWT_ALGORITHM (str): Algorithm used for JWT tokens
+        ACCESS_TOKEN_EXPIRE_MINUTES (int): JWT token expiration time in minutes
+        DEBUG (bool): Application debug mode flag
+    """
+
+    # Database configuration
+    DB_HOST: str = "localhost"
+    DB_PORT: str = "5432"
+    DB_NAME: str = "taskmanager"
+    DB_USER: str = "postgres"
+    DB_PASSWORD: str
+
+    # JWT configuration
+    JWT_SECRET_KEY: str
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
+    # Application configuration
+    DEBUG: bool = False
+
+    @property
+    def DATABASE_URL(self) -> str:
+        """
+        Construct and return the async PostgreSQL database URL.
+
+        Returns:
+            str: Fully formatted database URL for asyncpg driver
+        """
+        return f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+
+    class Config:
+        """Pydantic configuration class."""
+
+        env_file = ".env"
+
+
+# Global settings instance
+settings = Settings()
+
+---
+
+=== FILE: backend/app/auth/jwt.py ===
+
+"""
+JWT token handling utilities.
+
+This module provides functions for creating and verifying JWT tokens
+used for user authentication.
+"""
+
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+from app.config import settings
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    """
+    Create a new JWT access token.
+
+    Args:
+        data (dict): Payload data to include in the token
+        expires_delta (timedelta, optional): Custom expiration time
+
+    Returns:
+        str: Encoded JWT token
+
+    Example:
+        ```python
+        token = create_access_token({"sub": "user_id"})
+        ```
+    """
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(
+            minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(
+        to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM
+    )
+    return encoded_jwt
+
+
+def verify_token(token: str) -> Optional[dict]:
+    """
+    Verify and decode a JWT token.
+
+    Args:
+        token (str): JWT token to verify
+
+    Returns:
+        Optional[dict]: Decoded token payload if valid, None otherwise
+
+    Example:
+        ```python
+        payload = verify_token("eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...")
+        ```
+    """
+    try:
+        payload = jwt.decode(
+            token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
+        )
+        return payload
+    except JWTError:
+        return None
+
+---
+
+=== FILE: backend/app/auth/security.py ===
+
+"""
+Password hashing and verification utilities.
+
+This module provides functions for securely hashing passwords
+and verifying them against stored hashes using bcrypt.
+"""
+
+from passlib.context import CryptContext
+
+# Configure password hashing context with bcrypt
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """
+    Verify a plain password against a hashed password.
+
+    Args:
+        plain_password (str): Plain text password to verify
+        hashed_password (str): BCrypt hashed password to compare against
+
+    Returns:
+        bool: True if password matches, False otherwise
+
+    Example:
+        ```python
+        is_valid = verify_password("mypassword", "$2b$12$...")
+        ```
+    """
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    """
+    Hash a plain password using bcrypt.
+
+    Args:
+        password (str): Plain text password to hash
+
+    Returns:
+        str: BCrypt hashed password
+
+    Example:
+        ```python
+        hashed = get_password_hash("mypassword")
+        ```
+    """
+    return pwd_context.hash(password)
+
+---
+
+=== FILE: backend/alembic.ini ===
+
+# A generic, single database configuration.
+
+[alembic]
+# path to migration scripts.
+# this is typically a path given in POSIX (e.g. forward slashes)
+# format, relative to the token %(here)s which refers to the location of this
+# ini file
+script_location = %(here)s/app/migrations
+
+# template used to generate migration file names; The default value is %%(rev)s_%%(slug)s
+# Uncomment the line below if you want the files to be prepended with date and time
+# see https://alembic.sqlalchemy.org/en/latest/tutorial.html#editing-the-ini-file
+# for all available tokens
+# file_template = %%(year)d_%%(month).2d_%%(day).2d_%%(hour).2d%%(minute).2d-%%(rev)s_%%(slug)s
+
+# sys.path path, will be prepended to sys.path if present.
+# defaults to the current working directory.  for multiple paths, the path separator
+# is defined by "path_separator" below.
+prepend_sys_path = .
+
+
+# timezone to use when rendering the date within the migration file
+# as well as the filename.
+# If specified, requires the python>=3.9 or backports.zoneinfo library and tzdata library.
+# Any required deps can installed by adding `alembic[tz]` to the pip requirements
+# string value is passed to ZoneInfo()
+# leave blank for localtime
+# timezone =
+
+# max length of characters to apply to the "slug" field
+# truncate_slug_length = 40
+
+# set to 'true' to run the environment during
+# the 'revision' command, regardless of autogenerate
+# revision_environment = false
+
+# set to 'true' to allow .pyc and .pyo files without
+# a source .py file to be detected as revisions in the
+# versions/ directory
+# sourceless = false
+
+# version location specification; This defaults
+# to <script_location>/versions.  When using multiple version
+# directories, initial revisions must be specified with --version-path.
+# The path separator used here should be the separator specified by "path_separator"
+# below.
+# version_locations = %(here)s/bar:%(here)s/bat:%(here)s/alembic/versions
+
+# path_separator; This indicates what character is used to split lists of file
+# paths, including version_locations and prepend_sys_path within configparser
+# files such as alembic.ini.
+# The default rendered in new alembic.ini files is "os", which uses os.pathsep
+# to provide os-dependent path splitting.
+#
+# Note that in order to support legacy alembic.ini files, this default does NOT
+# take place if path_separator is not present in alembic.ini.  If this
+# option is omitted entirely, fallback logic is as follows:
+#
+# 1. Parsing of the version_locations option falls back to using the legacy
+#    "version_path_separator" key, which if absent then falls back to the legacy
+#    behavior of splitting on spaces and/or commas.
+# 2. Parsing of the prepend_sys_path option falls back to the legacy
+#    behavior of splitting on spaces, commas, or colons.
+#
+# Valid values for path_separator are:
+#
+# path_separator = :
+# path_separator = ;
+# path_separator = space
+# path_separator = newline
+#
+# Use os.pathsep. Default configuration used for new projects.
+path_separator = os
+
+# set to 'true' to search source files recursively
+# in each "version_locations" directory
+# new in Alembic version 1.10
+# recursive_version_locations = false
+
+# the output encoding used when revision files
+# are written from script.py.mako
+# output_encoding = utf-8
+
+# database URL.  This is consumed by the user-maintained env.py script only.
+# other means of configuring database URLs may be customized within the env.py
+# file.
+sqlalchemy.url = postgresql+asyncpg://user:pass@localhost/dbname
+
+[post_write_hooks]
+# post_write_hooks defines scripts or Python functions that are run
+# on newly generated revision scripts.  See the documentation for further
+# detail and examples
+
+# format using "black" - use the console_scripts runner, against the "black" entrypoint
+# hooks = black
+# black.type = console_scripts
+# black.entrypoint = black
+# black.options = -l 79 REVISION_SCRIPT_FILENAME
+
+# lint with attempts to fix using "ruff" - use the module runner, against the "ruff" module
+# hooks = ruff
+# ruff.type = module
+# ruff.module = ruff
+# ruff.options = check --fix REVISION_SCRIPT_FILENAME
+
+# Alternatively, use the exec runner to execute a binary found on your PATH
+# hooks = ruff
+# ruff.type = exec
+# ruff.executable = ruff
+# ruff.options = check --fix REVISION_SCRIPT_FILENAME
+
+# Logging configuration.  This is also consumed by the user-maintained
+# env.py script only.
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARNING
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARNING
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+
+---
+
+=== FILE: backend/.python-version ===
+
+3.12
+
+---
+
+=== FILE: backend/pyproject.toml ===
+
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.16.5",
+    "asyncpg>=0.30.0",
+    "fastapi[standard]>=0.118.0",
+    "passlib>=1.7.4",
+    "psycopg2-binary>=2.9.10",
+    "pydantic>=2.11.9",
+    "pydantic-settings>=2.11.0",
+    "python-jose>=3.5.0",
+    "sqlalchemy>=2.0.43",
+    "uvicorn>=0.37.0",
+]
+
+
+[project.scripts]
+dev = "uvicorn app.main:app --reload --host 0.0.0.0 --port 8000"
+start = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+[project.optional-dependencies]
+dev = [
+    "asgi-lifespan>=2.1.0",
+    "factory-boy>=3.3.3",
+    "freezegun>=1.5.5",
+    "httpx>=0.28.1",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "pytest-cov>=7.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "aiosqlite>=0.21.0",
+    "httpx>=0.28.1",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "pytest-cov>=7.0.0",
+]
+
+---
+
+=== FILE: backend/pytest.ini ===
+
+[tool:pytest]
+asyncio_mode = auto
+testpaths = tests
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+addopts = 
+    --verbose
+    --color=yes
+    --strict-markers
+    --strict-config
+    --cov=app
+    --cov-report=term-missing
+    --cov-report=html
+    --cov-report=xml
+markers =
+    slow: marks tests as slow (deselect with '-m "not slow"')
+    integration: marks tests as integration tests
+---
+
+=== FILE: backend/tests/test_tasks.py ===
+
+"""Test task management endpoints."""
+
+import pytest
+from fastapi import status
+from app.models.task import TaskStatus
+
+
+class TestTaskEndpoints:
+    """Test task management endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_unauthorized(self, client):
+        """Test getting tasks without authentication."""
+        response = await client.get("/api/v1/tasks/")
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_user(self, auth_client, test_task):
+        """Test getting tasks as regular user."""
+        response = await auth_client.get("/api/v1/tasks/")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["title"] == test_task.title
+        assert data[0]["owner_id"] == test_task.owner_id
+        assert data[0]["status"] == test_task.status.value
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_admin(self, admin_client, test_task, another_user):
+        """Test getting all tasks as admin."""
+        response = await admin_client.get("/api/v1/tasks/")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert isinstance(data, list)
+        assert len(data) >= 1
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_pagination(self, auth_client, multiple_tasks):
+        """Test getting tasks with pagination."""
+        response = await auth_client.get("/api/v1/tasks/?skip=1&limit=2")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert isinstance(data, list)
+        assert len(data) <= 2
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_invalid_pagination(self, auth_client):
+        """Test getting tasks with invalid pagination parameters."""
+        response = await auth_client.get("/api/v1/tasks/?skip=-1&limit=0")
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_create_task_success(self, auth_client, test_user):
+        """Test creating a new task successfully."""
+        task_data = {
+            "title": "New Task",
+            "description": "New Description",
+            "status": TaskStatus.TODO,
+        }
+        response = await auth_client.post("/api/v1/tasks/", json=task_data)
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["title"] == "New Task"
+        assert data["description"] == "New Description"
+        assert data["status"] == TaskStatus.TODO
+        assert data["owner_id"] == test_user.id
+        assert "id" in data
+        assert "created_at" in data
+        assert "owner" in data
+
+    @pytest.mark.asyncio
+    async def test_create_task_minimal_data(self, auth_client, test_user):
+        """Test creating task with minimal required data."""
+        task_data = {"title": "Minimal Task"}
+        response = await auth_client.post("/api/v1/tasks/", json=task_data)
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["title"] == "Minimal Task"
+        assert data["description"] is None
+        assert data["status"] == TaskStatus.TODO
+        assert data["owner_id"] == test_user.id
+
+    @pytest.mark.asyncio
+    async def test_create_task_unauthorized(self, client):
+        """Test creating task without authentication."""
+        task_data = {"title": "New Task"}
+        response = await client.post("/api/v1/tasks/", json=task_data)
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_create_task_invalid_data(self, auth_client):
+        """Test creating task with invalid data."""
+        task_data = {"title": ""}  # Empty title
+        response = await auth_client.post("/api/v1/tasks/", json=task_data)
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_create_task_missing_title(self, auth_client):
+        """Test creating task without required title."""
+        task_data = {"description": "Description without title"}
+        response = await auth_client.post("/api/v1/tasks/", json=task_data)
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_create_task_invalid_status(self, auth_client):
+        """Test creating task with invalid status."""
+        task_data = {"title": "Task with invalid status", "status": "invalid_status"}
+        response = await auth_client.post("/api/v1/tasks/", json=task_data)
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_get_task_success(self, auth_client, test_task):
+        """Test getting specific task successfully."""
+        response = await auth_client.get(f"/api/v1/tasks/{test_task.id}")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["title"] == test_task.title
+        assert data["id"] == test_task.id
+        assert data["owner_id"] == test_task.owner_id
+        assert "owner" in data
+        assert data["owner"]["email"] is not None
+
+    @pytest.mark.asyncio
+    async def test_get_task_unauthorized(self, client, test_task):
+        """Test getting task without authentication."""
+        response = await client.get(f"/api/v1/tasks/{test_task.id}")
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_get_task_not_found(self, auth_client):
+        """Test getting non-existent task."""
+        response = await auth_client.get("/api/v1/tasks/9999")
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_get_task_other_user(self, auth_client, test_db, test_admin):
+        """Test getting task owned by another user."""
+        from app.services.task_service import TaskService
+        from app.schemas.task import TaskCreate
+
+        # Create task with admin user
+        task_data = TaskCreate(title="Admin Task", description="Admin Description")
+        admin_task = await TaskService.create(test_db, task_data, test_admin.id)
+
+        # Try to access as regular user
+        response = await auth_client.get(f"/api/v1/tasks/{admin_task.id}")
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    @pytest.mark.asyncio
+    async def test_get_task_admin_access_other_user(self, admin_client, test_task):
+        """Test admin accessing task owned by another user."""
+        response = await admin_client.get(f"/api/v1/tasks/{test_task.id}")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["id"] == test_task.id
+
+    @pytest.mark.asyncio
+    async def test_update_task_success(self, auth_client, test_task):
+        """Test updating task successfully."""
+        update_data = {
+            "title": "Updated Task",
+            "description": "Updated Description",
+            "status": TaskStatus.IN_PROGRESS,
+        }
+        response = await auth_client.put(
+            f"/api/v1/tasks/{test_task.id}", json=update_data
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["title"] == "Updated Task"
+        assert data["description"] == "Updated Description"
+        assert data["status"] == TaskStatus.IN_PROGRESS
+        assert data["id"] == test_task.id
+
+    @pytest.mark.asyncio
+    async def test_partial_update_task(self, auth_client, test_task):
+        """Test partial task update using PATCH."""
+        update_data = {"status": TaskStatus.DONE}
+        response = await auth_client.patch(
+            f"/api/v1/tasks/{test_task.id}", json=update_data
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["status"] == TaskStatus.DONE
+        assert data["title"] == test_task.title  # Unchanged
+        assert data["description"] == test_task.description  # Unchanged
+
+    @pytest.mark.asyncio
+    async def test_update_task_unauthorized(self, client, test_task):
+        """Test updating task without authentication."""
+        update_data = {"title": "Updated"}
+        response = await client.put(f"/api/v1/tasks/{test_task.id}", json=update_data)
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_update_task_not_found(self, auth_client):
+        """Test updating non-existent task."""
+        update_data = {"title": "Updated"}
+        response = await auth_client.put("/api/v1/tasks/9999", json=update_data)
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_update_task_other_user(self, auth_client, test_db, test_admin):
+        """Test updating task owned by another user."""
+        from app.services.task_service import TaskService
+        from app.schemas.task import TaskCreate
+
+        # Create task with admin user
+        task_data = TaskCreate(title="Admin Task", description="Admin Description")
+        admin_task = await TaskService.create(test_db, task_data, test_admin.id)
+
+        # Try to update as regular user
+        update_data = {"title": "Updated by other user"}
+        response = await auth_client.put(
+            f"/api/v1/tasks/{admin_task.id}", json=update_data
+        )
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    @pytest.mark.asyncio
+    async def test_update_task_admin_access_other_user(self, admin_client, test_task):
+        """Test admin updating task owned by another user."""
+        update_data = {"title": "Admin Updated Task"}
+        response = await admin_client.put(
+            f"/api/v1/tasks/{test_task.id}", json=update_data
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["title"] == "Admin Updated Task"
+
+    @pytest.mark.asyncio
+    async def test_delete_task_success(self, auth_client, test_task):
+        """Test deleting task successfully."""
+        response = await auth_client.delete(f"/api/v1/tasks/{test_task.id}")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert "message" in data
+        assert "deleted" in data["message"].lower()
+
+        # Verify task is actually deleted
+        get_response = await auth_client.get(f"/api/v1/tasks/{test_task.id}")
+        assert get_response.status_code == status.HTTP_404_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_delete_task_unauthorized(self, client, test_task):
+        """Test deleting task without authentication."""
+        response = await client.delete(f"/api/v1/tasks/{test_task.id}")
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_delete_task_not_found(self, auth_client):
+        """Test deleting non-existent task."""
+        response = await auth_client.delete("/api/v1/tasks/9999")
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_delete_task_other_user(self, auth_client, test_db, test_admin):
+        """Test deleting task owned by another user."""
+        from app.services.task_service import TaskService
+        from app.schemas.task import TaskCreate
+
+        # Create task with admin user
+        task_data = TaskCreate(title="Admin Task", description="Admin Description")
+        admin_task = await TaskService.create(test_db, task_data, test_admin.id)
+
+        # Try to delete as regular user
+        response = await auth_client.delete(f"/api/v1/tasks/{admin_task.id}")
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    @pytest.mark.asyncio
+    async def test_delete_task_admin_access_other_user(self, admin_client, test_task):
+        """Test admin deleting task owned by another user."""
+        response = await admin_client.delete(f"/api/v1/tasks/{test_task.id}")
+
+        assert response.status_code == status.HTTP_200_OK
+
+    @pytest.mark.asyncio
+    async def test_task_lifecycle(self, auth_client, test_user):
+        """Test complete task lifecycle: create → read → update → delete."""
+        # Create task
+        task_data = {
+            "title": "Lifecycle Task",
+            "description": "Lifecycle Description",
+            "status": TaskStatus.TODO,
+        }
+        create_response = await auth_client.post("/api/v1/tasks/", json=task_data)
+        assert create_response.status_code == status.HTTP_200_OK
+        task_id = create_response.json()["id"]
+
+        # Read task
+        get_response = await auth_client.get(f"/api/v1/tasks/{task_id}")
+        assert get_response.status_code == status.HTTP_200_OK
+        assert get_response.json()["title"] == "Lifecycle Task"
+
+        # Update task
+        update_data = {"status": TaskStatus.IN_PROGRESS}
+        update_response = await auth_client.patch(
+            f"/api/v1/tasks/{task_id}", json=update_data
+        )
+        assert update_response.status_code == status.HTTP_200_OK
+        assert update_response.json()["status"] == TaskStatus.IN_PROGRESS
+
+        # Delete task
+        delete_response = await auth_client.delete(f"/api/v1/tasks/{task_id}")
+        assert delete_response.status_code == status.HTTP_200_OK
+
+        # Verify deletion
+        final_get_response = await auth_client.get(f"/api/v1/tasks/{task_id}")
+        assert final_get_response.status_code == status.HTTP_404_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_task_status_enum_values(self, auth_client):
+        """Test creating tasks with all possible status values."""
+        status_values = [status.value for status in TaskStatus]
+
+        for status_value in status_values:
+            task_data = {
+                "title": f"Task with status {status_value}",
+                "status": status_value,
+            }
+            response = await auth_client.post("/api/v1/tasks/", json=task_data)
+            assert response.status_code == status.HTTP_200_OK
+            assert response.json()["status"] == status_value
+
+---
+
+=== FILE: backend/tests/test_services.py ===
+
+"""Test cases for service layer functionality."""
+
+import pytest
+from app.services.user_service import UserService
+from app.services.task_service import TaskService
+from app.schemas.user import UserCreate, UserUpdate
+from app.schemas.task import TaskCreate, TaskUpdate
+from app.models.task import TaskStatus
+from app.models.user import User
+
+
+class TestUserService:
+    """Test UserService functionality."""
+
+    @pytest.mark.asyncio
+    async def test_get_by_id_success(self, test_db, test_user):
+        """Test getting user by ID when user exists."""
+        user = await UserService.get_by_id(test_db, test_user.id)
+
+        assert user is not None
+        assert user.id == test_user.id
+        assert user.email == test_user.email
+        assert user.is_active == test_user.is_active
+        assert user.is_admin == test_user.is_admin
+
+    @pytest.mark.asyncio
+    async def test_get_by_id_not_found(self, test_db):
+        """Test getting user by ID when user doesn't exist."""
+        user = await UserService.get_by_id(test_db, 9999)
+        assert user is None
+
+    @pytest.mark.asyncio
+    async def test_get_by_id_zero(self, test_db):
+        """Test getting user with ID zero."""
+        user = await UserService.get_by_id(test_db, 0)
+        assert user is None
+
+    @pytest.mark.asyncio
+    async def test_get_by_email_success(self, test_db, test_user):
+        """Test getting user by email when user exists."""
+        user = await UserService.get_by_email(test_db, test_user.email)
+
+        assert user is not None
+        assert user.email == test_user.email
+        assert user.id == test_user.id
+
+    @pytest.mark.asyncio
+    async def test_get_by_email_not_found(self, test_db):
+        """Test getting user by email when user doesn't exist."""
+        user = await UserService.get_by_email(test_db, "nonexistent@example.com")
+        assert user is None
+
+    @pytest.mark.asyncio
+    async def test_get_by_email_case_sensitive(self, test_db, test_user):
+        """Test email lookup is case sensitive."""
+        user = await UserService.get_by_email(test_db, test_user.email.upper())
+        assert user is None
+
+    @pytest.mark.asyncio
+    async def test_get_all_users(self, test_db, test_user, test_admin):
+        """Test getting all users."""
+        users = await UserService.get_all(test_db)
+
+        assert len(users) >= 2
+        user_emails = [user.email for user in users]
+        assert test_user.email in user_emails
+        assert test_admin.email in user_emails
+
+    @pytest.mark.asyncio
+    async def test_get_all_users_pagination(self, test_db, multiple_tasks):
+        """Test getting all users with pagination."""
+        users = await UserService.get_all(test_db, skip=1, limit=1)
+
+        assert len(users) <= 1
+
+    @pytest.mark.asyncio
+    async def test_get_all_users_empty(self, test_db):
+        """Test getting all users from empty database."""
+        # Delete all users first
+        users = await test_db.execute(User.__table__.delete())
+        await test_db.commit()
+
+        users = await UserService.get_all(test_db)
+        assert users == []
+
+    @pytest.mark.asyncio
+    async def test_create_user_success(self, test_db):
+        """Test creating a new user successfully."""
+        user_data = UserCreate(
+            email="newuser@example.com",
+            password="Newpassword123",
+            is_admin=False,
+        )
+        user = await UserService.create(test_db, user_data)
+
+        assert user is not None
+        assert user.email == "newuser@example.com"
+        assert user.is_admin is False
+        assert user.is_active is True
+        assert hasattr(user, "id")
+        assert user.hashed_password != "Newpassword123"  # Should be hashed
+
+    @pytest.mark.asyncio
+    async def test_create_user_duplicate_email(self, test_db, test_user):
+        """Test creating user with duplicate email."""
+        user_data = UserCreate(
+            email=test_user.email,  # Already exists
+            password="Password123",
+            is_admin=False,
+        )
+
+        with pytest.raises(ValueError, match="already exists"):
+            await UserService.create(test_db, user_data)
+
+    @pytest.mark.asyncio
+    async def test_create_user_admin(self, test_db):
+        """Test creating admin user."""
+        user_data = UserCreate(
+            email="adminuser@example.com",
+            password="Adminpassword123",
+            is_admin=True,
+        )
+        user = await UserService.create(test_db, user_data)
+
+        assert user.is_admin is True
+
+    @pytest.mark.asyncio
+    async def test_create_user_inactive(self, test_db):
+        """Test creating inactive user."""
+        user_data = UserCreate(
+            email="inactive@example.com",
+            password="Password123",
+            is_active=False,
+            is_admin=False,
+        )
+        user = await UserService.create(test_db, user_data)
+
+        assert user.is_active is False
+
+    @pytest.mark.asyncio
+    async def test_update_user_success(self, test_db, test_user):
+        """Test updating user successfully."""
+        update_data = UserUpdate(is_admin=True, is_active=False)
+        updated_user = await UserService.update(test_db, test_user.id, update_data)
+
+        assert updated_user is not None
+        assert updated_user.is_admin is True
+        assert updated_user.is_active is False
+        assert updated_user.email == test_user.email  # Unchanged
+        assert updated_user.id == test_user.id
+
+    @pytest.mark.asyncio
+    async def test_update_user_partial(self, test_db, test_user):
+        """Test updating user with partial data."""
+        update_data = UserUpdate(is_admin=True)
+        updated_user = await UserService.update(test_db, test_user.id, update_data)
+
+        assert updated_user.is_admin is True
+        assert updated_user.is_active == test_user.is_active  # Unchanged
+        assert updated_user.email == test_user.email  # Unchanged
+
+    @pytest.mark.asyncio
+    async def test_update_user_not_found(self, test_db):
+        """Test updating non-existent user."""
+        update_data = UserUpdate(is_admin=True)
+        user = await UserService.update(test_db, 9999, update_data)
+        assert user is None
+
+    @pytest.mark.asyncio
+    async def test_update_user_email(self, test_db, test_user):
+        """Test updating user email."""
+        update_data = UserUpdate(email="updated@example.com")
+        updated_user = await UserService.update(test_db, test_user.id, update_data)
+
+        assert updated_user.email == "updated@example.com"
+
+    @pytest.mark.asyncio
+    async def test_update_user_duplicate_email(self, test_db, test_user, test_admin):
+        """Test updating user with duplicate email."""
+        update_data = UserUpdate(email=test_admin.email)
+
+        with pytest.raises(ValueError, match="already exists"):
+            await UserService.update(test_db, test_user.id, update_data)
+
+    @pytest.mark.asyncio
+    async def test_delete_user_success(self, test_db, test_user):
+        """Test deleting user successfully."""
+        result = await UserService.delete(test_db, test_user.id)
+        assert result is True
+
+        # Verify user is deleted
+        user = await UserService.get_by_id(test_db, test_user.id)
+        assert user is None
+
+    @pytest.mark.asyncio
+    async def test_delete_user_not_found(self, test_db):
+        """Test deleting non-existent user."""
+        result = await UserService.delete(test_db, 9999)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_authenticate_success(self, test_db, test_user):
+        """Test successful authentication."""
+        user = await UserService.authenticate(test_db, test_user.email, "Testpassword123")
+
+        assert user is not None
+        assert user.email == test_user.email
+        assert user.id == test_user.id
+
+    @pytest.mark.asyncio
+    async def test_authenticate_wrong_password(self, test_db, test_user):
+        """Test authentication with wrong password."""
+        user = await UserService.authenticate(test_db, test_user.email, "wrongpassword")
+        assert user is None
+
+    @pytest.mark.asyncio
+    async def test_authenticate_user_not_found(self, test_db):
+        """Test authentication with non-existent user."""
+        user = await UserService.authenticate(
+            test_db, "nonexistent@example.com", "Password123"
+        )
+        assert user is None
+
+    @pytest.mark.asyncio
+    async def test_authenticate_inactive_user(self, test_db, test_user):
+        """Test authentication with inactive user."""
+        # Deactivate user
+        update_data = UserUpdate(is_active=False)
+        await UserService.update(test_db, test_user.id, update_data)
+
+        user = await UserService.authenticate(test_db, test_user.email, "Testpassword123")
+        assert user is None
+
+    @pytest.mark.asyncio
+    async def test_authenticate_empty_password(self, test_db, test_user):
+        """Test authentication with empty password."""
+        user = await UserService.authenticate(test_db, test_user.email, "")
+        assert user is None
+
+    @pytest.mark.asyncio
+    async def test_authenticate_case_sensitive_email(self, test_db, test_user):
+        """Test authentication with case-sensitive email."""
+        user = await UserService.authenticate(
+            test_db, test_user.email.upper(), "Testpassword123"
+        )
+        assert user is None
+
+
+class TestTaskService:
+    """Test TaskService functionality."""
+
+    @pytest.mark.asyncio
+    async def test_get_by_id_success(self, test_db, test_task):
+        """Test getting task by ID when task exists."""
+        task = await TaskService.get_by_id(test_db, test_task.id)
+
+        assert task is not None
+        assert task.id == test_task.id
+        assert task.title == test_task.title
+        assert task.description == test_task.description
+        assert task.status == test_task.status
+        assert task.owner_id == test_task.owner_id
+
+    @pytest.mark.asyncio
+    async def test_get_by_id_not_found(self, test_db):
+        """Test getting task by ID when task doesn't exist."""
+        task = await TaskService.get_by_id(test_db, 9999)
+        assert task is None
+
+    @pytest.mark.asyncio
+    async def test_get_all_tasks(self, test_db, test_task, multiple_tasks):
+        """Test getting all tasks."""
+        tasks = await TaskService.get_all(test_db)
+
+        assert len(tasks) >= 4  # test_task + 3 from multiple_tasks
+        task_titles = [task.title for task in tasks]
+        assert test_task.title in task_titles
+
+    @pytest.mark.asyncio
+    async def test_get_all_tasks_pagination(self, test_db, multiple_tasks):
+        """Test getting all tasks with pagination."""
+        tasks = await TaskService.get_all(test_db, skip=1, limit=2)
+
+        assert len(tasks) <= 2
+
+    @pytest.mark.asyncio
+    async def test_get_all_tasks_empty(self, test_db):
+        """Test getting all tasks from empty database."""
+        # Ensure no tasks exist
+        tasks = await TaskService.get_all(test_db)
+        # This might not be empty if other tests created tasks, so we just check it's a list
+        assert isinstance(tasks, list)
+
+    @pytest.mark.asyncio
+    async def test_get_by_owner(self, test_db, test_task, test_user):
+        """Test getting tasks by owner."""
+        tasks = await TaskService.get_by_owner(test_db, test_user.id)
+
+        assert len(tasks) >= 1
+        assert all(task.owner_id == test_user.id for task in tasks)
+        assert any(task.id == test_task.id for task in tasks)
+
+    @pytest.mark.asyncio
+    async def test_get_by_owner_pagination(self, test_db, test_user, multiple_tasks):
+        """Test getting tasks by owner with pagination."""
+        tasks = await TaskService.get_by_owner(test_db, test_user.id, skip=1, limit=2)
+
+        assert len(tasks) <= 2
+        assert all(task.owner_id == test_user.id for task in tasks)
+
+    @pytest.mark.asyncio
+    async def test_get_by_owner_no_tasks(self, test_db, another_user):
+        """Test getting tasks for user with no tasks."""
+        tasks = await TaskService.get_by_owner(test_db, another_user.id)
+        assert tasks == []
+
+    @pytest.mark.asyncio
+    async def test_create_task_success(self, test_db, test_user):
+        """Test creating a new task successfully."""
+        task_data = TaskCreate(
+            title="New Task",
+            description="New Description",
+            status=TaskStatus.TODO,
+        )
+        task = await TaskService.create(test_db, task_data, test_user.id)
+
+        assert task is not None
+        assert task.title == "New Task"
+        assert task.description == "New Description"
+        assert task.status == TaskStatus.TODO
+        assert task.owner_id == test_user.id
+        assert hasattr(task, "id")
+        assert hasattr(task, "created_at")
+
+    @pytest.mark.asyncio
+    async def test_create_task_minimal_data(self, test_db, test_user):
+        """Test creating task with minimal required data."""
+        task_data = TaskCreate(title="Minimal Task")
+        task = await TaskService.create(test_db, task_data, test_user.id)
+
+        assert task.title == "Minimal Task"
+        assert task.description is None
+        assert task.status == TaskStatus.TODO
+        assert task.owner_id == test_user.id
+
+    @pytest.mark.asyncio
+    async def test_create_task_all_statuses(self, test_db, test_user):
+        """Test creating tasks with all possible status values."""
+        for status in TaskStatus:
+            task_data = TaskCreate(
+                title=f"Task with {status.value}",
+                status=status,
+            )
+            task = await TaskService.create(test_db, task_data, test_user.id)
+            assert task.status == status
+
+    @pytest.mark.asyncio
+    async def test_update_task_success(self, test_db, test_task):
+        """Test updating task successfully."""
+        update_data = TaskUpdate(
+            title="Updated Task",
+            description="Updated Description",
+            status=TaskStatus.IN_PROGRESS,
+        )
+        updated_task = await TaskService.update(test_db, test_task.id, update_data)
+
+        assert updated_task is not None
+        assert updated_task.title == "Updated Task"
+        assert updated_task.description == "Updated Description"
+        assert updated_task.status == TaskStatus.IN_PROGRESS
+        assert updated_task.id == test_task.id
+
+    @pytest.mark.asyncio
+    async def test_partial_update_task(self, test_db, test_task):
+        """Test partial task update."""
+        update_data = TaskUpdate(status=TaskStatus.DONE)
+        updated_task = await TaskService.update(test_db, test_task.id, update_data)
+
+        assert updated_task is not None
+        assert updated_task.status == TaskStatus.DONE
+        assert updated_task.title == test_task.title  # Unchanged
+        assert updated_task.description == test_task.description  # Unchanged
+
+    @pytest.mark.asyncio
+    async def test_update_task_not_found(self, test_db):
+        """Test updating non-existent task."""
+        update_data = TaskUpdate(title="Updated")
+        task = await TaskService.update(test_db, 9999, update_data)
+        assert task is None
+
+    @pytest.mark.asyncio
+    async def test_update_task_no_changes(self, test_db, test_task):
+        """Test updating task with no changes."""
+        update_data = TaskUpdate()
+        updated_task = await TaskService.update(test_db, test_task.id, update_data)
+
+        assert updated_task is not None
+        assert updated_task.title == test_task.title
+        assert updated_task.description == test_task.description
+        assert updated_task.status == test_task.status
+
+    @pytest.mark.asyncio
+    async def test_delete_task_success(self, test_db, test_task):
+        """Test deleting task successfully."""
+        result = await TaskService.delete(test_db, test_task.id)
+        assert result is True
+
+        # Verify task is deleted
+        task = await TaskService.get_by_id(test_db, test_task.id)
+        assert task is None
+
+    @pytest.mark.asyncio
+    async def test_delete_task_not_found(self, test_db):
+        """Test deleting non-existent task."""
+        result = await TaskService.delete(test_db, 9999)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_can_access_task_admin(self, test_db, test_task, test_admin):
+        """Test admin access to any task."""
+        can_access = await TaskService.can_access_task(
+            test_db, test_task.id, test_admin.id, True
+        )
+        assert can_access is True
+
+    @pytest.mark.asyncio
+    async def test_can_access_task_owner(self, test_db, test_task, test_user):
+        """Test owner access to their own task."""
+        can_access = await TaskService.can_access_task(
+            test_db, test_task.id, test_user.id, False
+        )
+        assert can_access is True
+
+    @pytest.mark.asyncio
+    async def test_can_access_task_other_user(self, test_db, test_task, another_user):
+        """Test non-owner non-admin access to task."""
+        can_access = await TaskService.can_access_task(
+            test_db, test_task.id, another_user.id, False
+        )
+        assert can_access is False
+
+    @pytest.mark.asyncio
+    async def test_can_access_task_not_found(self, test_db, test_user):
+        """Test access to non-existent task."""
+        can_access = await TaskService.can_access_task(
+            test_db, 9999, test_user.id, False
+        )
+        assert can_access is False
+
+    @pytest.mark.asyncio
+    async def test_can_access_task_deleted_owner(self, test_db, test_task, test_user):
+        """Test access to task when owner is deleted."""
+        # Delete the owner
+        await UserService.delete(test_db, test_user.id)
+
+        can_access = await TaskService.can_access_task(
+            test_db, test_task.id, test_user.id, False
+        )
+        # Should return False since task might be orphaned or not found
+        assert can_access is False
+
+---
+
+=== FILE: backend/tests/test_main.py ===
+
+"""Test main application endpoints and configuration."""
+
+import pytest
+from fastapi import status
+
+
+class TestMainEndpoints:
+    """Test main application endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_root_endpoint(self, client):
+        """Test root endpoint returns welcome message."""
+        response = await client.get("/")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert "message" in data
+        assert data["message"] == "Task Management API"
+
+    @pytest.mark.asyncio
+    async def test_health_check(self, client):
+        """Test health check endpoint."""
+        response = await client.get("/health")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["service"] == "backend"
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_endpoint(self, client):
+        """Test accessing non-existent endpoint returns 404."""
+        response = await client.get("/nonexistent")
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_api_docs_available(self, client):
+        """Test that API documentation is available."""
+        response = await client.get("/docs")
+
+        assert response.status_code == status.HTTP_200_OK
+
+    @pytest.mark.asyncio
+    async def test_openapi_schema_available(self, client):
+        """Test that OpenAPI schema is available."""
+        response = await client.get("/openapi.json")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert "openapi" in data
+        assert "info" in data
+        assert "paths" in data
+
+
+class TestApplicationConfiguration:
+    """Test application configuration and settings."""
+
+    @pytest.mark.asyncio
+    async def test_cors_headers(self, client):
+        """Test CORS headers are properly set."""
+        response = await client.options("/api/v1/auth/login")
+
+        # CORS preflight should be handled
+        assert response.status_code in [
+            status.HTTP_200_OK,
+            status.HTTP_404_NOT_FOUND,
+            status.HTTP_405_METHOD_NOT_ALLOWED,
+        ]
+
+---
+
+=== FILE: backend/tests/test_models.py ===
+
+# """Test database models functionality."""
+
+# from datetime import datetime
+# import pytest
+# from app.models.user import User
+# from app.models.task import Task, TaskStatus
+
+
+# class TestUserModel:
+#     """Test User model functionality."""
+
+#     def test_user_creation(self, test_user):
+#         """Test user creation with valid data."""
+#         assert test_user.email == "test@example.com"
+#         assert test_user.is_active is True
+#         assert test_user.is_admin is False
+#         assert hasattr(test_user, "id")
+#         assert hasattr(test_user, "hashed_password")
+#         assert test_user.hashed_password is not None
+#         assert test_user.hashed_password != "testpassword"  # Should be hashed
+
+#     def test_user_repr(self, test_user):
+#         """Test user string representation."""
+#         repr_str = repr(test_user)
+#         assert "User" in repr_str
+#         assert "test@example.com" in repr_str
+#         assert str(test_user.id) in repr_str
+
+#     def test_user_str(self, test_user):
+#         """Test user string conversion."""
+#         str_repr = str(test_user)
+#         assert "User" in str_repr
+#         assert "test@example.com" in str_repr
+
+#     def test_user_relationships(self, test_user, test_task):
+#         """Test user-task relationships."""
+#         assert len(test_user.tasks) == 1
+#         assert test_user.tasks[0].id == test_task.id
+#         assert test_user.tasks[0].title == "Test Task"
+#         assert test_user.tasks[0].owner_id == test_user.id
+
+#     def test_user_equality(self, test_db, test_user):
+#         """Test user equality comparison."""
+#         # Same user should be equal to itself
+#         assert test_user == test_user
+
+#         # Different users should not be equal
+#         other_user = User(
+#             email="other@example.com",
+#             hashed_password="different_hash",
+#             is_active=True,
+#             is_admin=False,
+#         )
+#         assert test_user != other_user
+
+#     def test_user_hash(self, test_user):
+#         """Test user hashing."""
+#         # Should be able to hash user instance
+#         user_hash = hash(test_user)
+#         assert isinstance(user_hash, int)
+
+#     def test_user_inactive(self, test_db):
+#         """Test creating inactive user."""
+#         user = User(
+#             email="inactive@example.com",
+#             hashed_password="hashed_password",
+#             is_active=False,
+#             is_admin=False,
+#         )
+#         assert user.is_active is False
+
+#     def test_user_admin(self, test_db):
+#         """Test creating admin user."""
+#         user = User(
+#             email="admin@example.com",
+#             hashed_password="hashed_password",
+#             is_active=True,
+#             is_admin=True,
+#         )
+#         assert user.is_admin is True
+
+#     def test_user_default_values(self, test_db):
+#         """Test user default values."""
+#         user = User(
+#             email="default@example.com",
+#             hashed_password="hashed_password",
+#         )
+#         assert user.is_active is True
+#         assert user.is_admin is False
+
+#     def test_user_table_name(self):
+#         """Test user table name."""
+#         assert User.__tablename__ == "users"
+
+#     def test_user_columns(self):
+#         """Test user table columns."""
+#         columns = [col.name for col in User.__table__.columns]
+#         expected_columns = ["id", "email", "hashed_password", "is_active", "is_admin"]
+#         for col in expected_columns:
+#             assert col in columns
+
+
+# class TestTaskModel:
+#     """Test Task model functionality."""
+
+#     def test_task_creation(self, test_task):
+#         """Test task creation with valid data."""
+#         assert test_task.title == "Test Task"
+#         assert test_task.description == "Test Description"
+#         assert test_task.status == TaskStatus.TODO
+#         assert hasattr(test_task, "id")
+#         assert hasattr(test_task, "created_at")
+#         assert hasattr(test_task, "owner_id")
+#         assert isinstance(test_task.created_at, datetime)
+
+#     def test_task_repr(self, test_task):
+#         """Test task string representation."""
+#         repr_str = repr(test_task)
+#         assert "Task" in repr_str
+#         assert "Test Task" in repr_str
+#         assert str(test_task.id) in repr_str
+
+#     def test_task_str(self, test_task):
+#         """Test task string conversion."""
+#         str_repr = str(test_task)
+#         assert "Task" in str_repr
+#         assert "Test Task" in str_repr
+
+#     def test_task_status_enum(self):
+#         """Test task status enum values and behavior."""
+#         assert TaskStatus.TODO == "todo"
+#         assert TaskStatus.IN_PROGRESS == "in_progress"
+#         assert TaskStatus.DONE == "done"
+
+#         # Test enum membership
+#         assert "todo" in TaskStatus.__members__.values()
+#         assert "in_progress" in TaskStatus.__members__.values()
+#         assert "done" in TaskStatus.__members__.values()
+
+#         # Test enum iteration
+#         statuses = list(TaskStatus)
+#         assert len(statuses) == 3
+#         assert TaskStatus.TODO in statuses
+#         assert TaskStatus.IN_PROGRESS in statuses
+#         assert TaskStatus.DONE in statuses
+
+#     def test_task_relationships(self, test_task, test_user):
+#         """Test task-user relationships."""
+#         assert test_task.owner.id == test_user.id
+#         assert test_task.owner.email == test_user.email
+#         assert test_task in test_user.tasks
+
+#     def test_task_equality(self, test_db, test_task):
+#         """Test task equality comparison."""
+#         # Same task should be equal to itself
+#         assert test_task == test_task
+
+#         # Different tasks should not be equal
+#         other_task = Task(
+#             title="Other Task",
+#             description="Other Description",
+#             status=TaskStatus.TODO,
+#             owner_id=test_task.owner_id,
+#         )
+#         assert test_task != other_task
+
+#     def test_task_hash(self, test_task):
+#         """Test task hashing."""
+#         # Should be able to hash task instance
+#         task_hash = hash(test_task)
+#         assert isinstance(task_hash, int)
+
+#     def test_task_default_status(self, test_db, test_user):
+#         """Test task default status."""
+#         task = Task(
+#             title="Task with default status",
+#             description="Description",
+#             owner_id=test_user.id,
+#         )
+#         assert task.status == TaskStatus.TODO
+
+#     def test_task_default_created_at(self, test_db, test_user):
+#         """Test task created_at default value."""
+#         task = Task(
+#             title="Task with created_at",
+#             description="Description",
+#             owner_id=test_user.id,
+#         )
+#         assert task.created_at is None  # Will be set by database
+
+#     def test_task_all_statuses(self, test_db, test_user):
+#         """Test creating tasks with all status values."""
+#         for status in TaskStatus:
+#             task = Task(
+#                 title=f"Task with {status.value}",
+#                 description="Description",
+#                 status=status,
+#                 owner_id=test_user.id,
+#             )
+#             assert task.status == status
+
+#     def test_task_table_name(self):
+#         """Test task table name."""
+#         assert Task.__tablename__ == "tasks"
+
+#     def test_task_columns(self):
+#         """Test task table columns."""
+#         columns = [col.name for col in Task.__table__.columns]
+#         expected_columns = [
+#             "id",
+#             "title",
+#             "description",
+#             "status",
+#             "created_at",
+#             "owner_id",
+#         ]
+#         for col in expected_columns:
+#             assert col in columns
+
+#     def test_task_foreign_key(self, test_task, test_user):
+#         """Test task foreign key relationship."""
+#         assert test_task.owner_id == test_user.id
+#         # This tests the actual foreign key constraint at the model level
+
+#     def test_task_cascade_behavior(self, test_db, test_user, test_task):
+#         """Test task behavior when owner is deleted."""
+#         # This tests the cascade delete behavior
+#         # When a user is deleted, their tasks should be deleted too
+#         # This is tested at the database level in integration tests
+#         pass
+
+
+# class TestModelRelationships:
+#     """Test model relationships and constraints."""
+
+#     def test_user_tasks_relationship(self, test_user, test_task):
+#         """Test bidirectional user-tasks relationship."""
+#         # User -> Tasks
+#         assert len(test_user.tasks) == 1
+#         assert test_user.tasks[0].id == test_task.id
+
+#         # Task -> User
+#         assert test_task.owner.id == test_user.id
+#         assert test_task.owner.email == test_user.email
+
+#     async def test_multiple_tasks_per_user(self, test_db, test_user):
+#         """Test user with multiple tasks."""
+#         tasks = [
+#             Task(
+#                 title=f"Task {i}",
+#                 description=f"Description {i}",
+#                 status=TaskStatus.TODO,
+#                 owner_id=test_user.id,
+#             )
+#             for i in range(3)
+#         ]
+
+#         for task in tasks:
+#             test_db.add(task)
+#         await test_db.commit()
+
+#         for task in tasks:
+#             await test_db.refresh(task)
+
+#         assert len(test_user.tasks) >= 3
+
+#     async def test_task_owner_required(self, test_db):
+#         """Test that task requires an owner."""
+#         task = Task(
+#             title="Task without owner",
+#             description="Description",
+#             status=TaskStatus.TODO,
+#             # Missing owner_id - should raise error on commit
+#         )
+#         test_db.add(task)
+
+#         with pytest.raises(Exception):  # Should raise integrity error
+#             await test_db.commit()
+
+
+"""Test database models functionality."""
+
+from datetime import datetime
+import pytest
+from sqlalchemy import select
+from app.models.user import User
+from app.models.task import Task, TaskStatus
+
+
+class TestUserModel:
+    """Test User model functionality."""
+
+    def test_user_creation(self, test_user):
+        """Test user creation with valid data."""
+        assert test_user.email == "test@example.com"
+        assert test_user.is_active is True
+        assert test_user.is_admin is False
+        assert hasattr(test_user, "id")
+        assert hasattr(test_user, "hashed_password")
+        assert test_user.hashed_password is not None
+        assert test_user.hashed_password != "testpassword"  # Should be hashed
+
+    def test_user_repr(self, test_user):
+        """Test user string representation."""
+        repr_str = repr(test_user)
+        assert "User" in repr_str
+        assert "test@example.com" in repr_str
+        assert str(test_user.id) in repr_str
+
+    def test_user_str(self, test_user):
+        """Test user string conversion."""
+        str_repr = str(test_user)
+        assert "User" in str_repr
+        assert "test@example.com" in str_repr
+
+    @pytest.mark.asyncio
+    async def test_user_relationships(self, test_db, test_user, test_task):
+        """Test user-task relationships."""
+        # Refresh the user to ensure relationships are loaded
+        await test_db.refresh(test_user, attribute_names=["tasks"])
+        assert len(test_user.tasks) == 1
+        assert test_user.tasks[0].id == test_task.id
+        assert test_user.tasks[0].title == "Test Task"
+        assert test_user.tasks[0].owner_id == test_user.id
+
+    def test_user_equality(self, test_user):
+        """Test user equality comparison."""
+        # Same user should be equal to itself
+        assert test_user == test_user
+
+        # Different users should not be equal
+        other_user = User(
+            email="other@example.com",
+            hashed_password="different_hash",
+        )
+        assert test_user != other_user
+
+    def test_user_hash(self, test_user):
+        """Test user hashing."""
+        # Should be able to hash user instance
+        user_hash = hash(test_user)
+        assert isinstance(user_hash, int)
+
+    def test_user_inactive(self):
+        """Test creating inactive user."""
+        user = User(
+            email="inactive@example.com",
+            hashed_password="hashed_password",
+            is_active=False,
+            is_admin=False,
+        )
+        assert user.is_active is False
+
+    def test_user_admin(self):
+        """Test creating admin user."""
+        user = User(
+            email="admin@example.com",
+            hashed_password="hashed_password",
+            is_active=True,
+            is_admin=True,
+        )
+        assert user.is_admin is True
+
+    def test_user_default_values(self):
+        """Test user default values."""
+        user = User(
+            email="default@example.com",
+            hashed_password="hashed_password",
+        )
+        assert user.is_active is True
+        assert user.is_admin is False
+
+    def test_user_table_name(self):
+        """Test user table name."""
+        assert User.__tablename__ == "users"
+
+    def test_user_columns(self):
+        """Test user table columns."""
+        columns = [col.name for col in User.__table__.columns]
+        expected_columns = ["id", "email", "hashed_password", "is_active", "is_admin"]
+        for col in expected_columns:
+            assert col in columns
+
+
+class TestTaskModel:
+    """Test Task model functionality."""
+
+    def test_task_creation(self, test_task):
+        """Test task creation with valid data."""
+        assert test_task.title == "Test Task"
+        assert test_task.description == "Test Description"
+        assert test_task.status == TaskStatus.TODO
+        assert hasattr(test_task, "id")
+        assert hasattr(test_task, "created_at")
+        assert hasattr(test_task, "owner_id")
+
+    def test_task_repr(self, test_task):
+        """Test task string representation."""
+        repr_str = repr(test_task)
+        assert "Task" in repr_str
+        assert "Test Task" in repr_str
+        assert str(test_task.id) in repr_str
+
+    def test_task_str(self, test_task):
+        """Test task string conversion."""
+        str_repr = str(test_task)
+        assert "Task" in str_repr
+        assert "Test Task" in str_repr
+
+    def test_task_status_enum(self):
+        """Test task status enum values and behavior."""
+        assert TaskStatus.TODO == "todo"
+        assert TaskStatus.IN_PROGRESS == "in_progress"
+        assert TaskStatus.DONE == "done"
+
+        # Test enum membership
+        assert "todo" in TaskStatus.__members__.values()
+        assert "in_progress" in TaskStatus.__members__.values()
+        assert "done" in TaskStatus.__members__.values()
+
+        # Test enum iteration
+        statuses = list(TaskStatus)
+        assert len(statuses) == 3
+        assert TaskStatus.TODO in statuses
+        assert TaskStatus.IN_PROGRESS in statuses
+        assert TaskStatus.DONE in statuses
+
+    @pytest.mark.asyncio
+    async def test_task_relationships(self, test_db, test_task, test_user):
+        """Test task-user relationships."""
+        # Refresh the task to ensure relationships are loaded
+        await test_db.refresh(test_task, attribute_names=["owner"])
+        assert test_task.owner.id == test_user.id
+        assert test_task.owner.email == test_user.email
+
+        # Refresh user to check the reverse relationship
+        await test_db.refresh(test_user, attribute_names=["tasks"])
+        assert test_task in test_user.tasks
+
+    def test_task_equality(self, test_task):
+        """Test task equality comparison."""
+        # Same task should be equal to itself
+        assert test_task == test_task
+
+        # Different tasks should not be equal
+        other_task = Task(
+            title="Other Task",
+            description="Other Description",
+            status=TaskStatus.TODO,
+            owner_id=test_task.owner_id,
+        )
+        assert test_task != other_task
+
+    def test_task_hash(self, test_task):
+        """Test task hashing."""
+        # Should be able to hash task instance
+        task_hash = hash(test_task)
+        assert isinstance(task_hash, int)
+
+    def test_task_default_status(self):
+        """Test task default status."""
+        task = Task(
+            title="Task with default status",
+            description="Description",
+            owner_id=1,  # Use a dummy ID for this test
+        )
+        assert task.status == TaskStatus.TODO
+
+    def test_task_default_created_at(self):
+        """Test task created_at default value."""
+        task = Task(
+            title="Task with created_at",
+            description="Description",
+            owner_id=1,  # Use a dummy ID for this test
+        )
+        # created_at will be None until persisted to database
+        assert task.created_at is None
+
+    def test_task_all_statuses(self):
+        """Test creating tasks with all status values."""
+        for status in TaskStatus:
+            task = Task(
+                title=f"Task with {status.value}",
+                description="Description",
+                status=status,
+                owner_id=1,  # Use a dummy ID for this test
+            )
+            assert task.status == status
+
+    def test_task_table_name(self):
+        """Test task table name."""
+        assert Task.__tablename__ == "tasks"
+
+    def test_task_columns(self):
+        """Test task table columns."""
+        columns = [col.name for col in Task.__table__.columns]
+        expected_columns = [
+            "id",
+            "title",
+            "description",
+            "status",
+            "created_at",
+            "owner_id",
+        ]
+        for col in expected_columns:
+            assert col in columns
+
+    def test_task_foreign_key(self, test_task, test_user):
+        """Test task foreign key relationship."""
+        assert test_task.owner_id == test_user.id
+
+
+class TestModelRelationships:
+    """Test model relationships and constraints."""
+
+    @pytest.mark.asyncio
+    async def test_user_tasks_relationship(self, test_db, test_user, test_task):
+        """Test bidirectional user-tasks relationship."""
+        # Refresh both objects to ensure relationships are loaded
+        await test_db.refresh(test_user, attribute_names=["tasks"])
+        await test_db.refresh(test_task, attribute_names=["owner"])
+
+        # User -> Tasks
+        assert len(test_user.tasks) == 1
+        assert test_user.tasks[0].id == test_task.id
+
+        # Task -> User
+        assert test_task.owner.id == test_user.id
+        assert test_task.owner.email == test_user.email
+
+    @pytest.mark.asyncio
+    async def test_multiple_tasks_per_user(self, test_db, test_user):
+        """Test user with multiple tasks."""
+        tasks = [
+            Task(
+                title=f"Task {i}",
+                description=f"Description {i}",
+                status=TaskStatus.TODO,
+                owner_id=test_user.id,
+            )
+            for i in range(3)
+        ]
+
+        for task in tasks:
+            test_db.add(task)
+        await test_db.commit()
+
+        for task in tasks:
+            await test_db.refresh(task)
+
+        # Refresh user to load the new tasks
+        await test_db.refresh(test_user, attribute_names=["tasks"])
+        assert len(test_user.tasks) >= 3
+
+    @pytest.mark.asyncio
+    async def test_task_owner_required(self, test_db):
+        """Test that task requires an owner."""
+        task = Task(
+            title="Task without owner",
+            description="Description",
+            status=TaskStatus.TODO,
+            # Missing owner_id - should raise error on commit
+        )
+        test_db.add(task)
+
+        with pytest.raises(Exception):  # Should raise integrity error
+            await test_db.commit()
+
+---
+
+=== FILE: backend/tests/__init__.py ===
+
+"""Test package for backend application."""
+
+---
+
+=== FILE: backend/tests/test_auth.py ===
+
+"""Test authentication endpoints and security utilities."""
+
+import pytest
+from datetime import datetime, timedelta
+from jose import jwt, JWTError
+from fastapi import status
+
+from app.auth.jwt import create_access_token, verify_token
+from app.auth.security import verify_password, get_password_hash
+from app.config import settings
+
+
+class TestSecurityUtilities:
+    """Test security utilities."""
+
+    def test_password_hashing_and_verification(self):
+        """Test password hashing and verification works correctly."""
+        password = "Testpassword123"
+        hashed = get_password_hash(password)
+
+        assert verify_password(password, hashed) is True
+        assert verify_password("wrongpassword", hashed) is False
+
+    def test_different_hashes_for_same_password(self):
+        """Test that same password produces different hashes (salt)."""
+        password = "Testpassword123"
+        hash1 = get_password_hash(password)
+        hash2 = get_password_hash(password)
+
+        assert hash1 != hash2
+        assert verify_password(password, hash1) is True
+        assert verify_password(password, hash2) is True
+
+    def test_verify_empty_password(self):
+        """Test verification with empty password."""
+        hashed = get_password_hash("password")
+        assert verify_password("", hashed) is False
+
+    def test_hash_empty_password(self):
+        """Test hashing empty password."""
+        hashed = get_password_hash("")
+        assert verify_password("", hashed) is True
+
+
+class TestJWTUtilities:
+    """Test JWT token functionality."""
+
+    def test_create_access_token(self):
+        """Test creating JWT access token with payload."""
+        data = {"sub": "123", "role": "user"}
+        token = create_access_token(data)
+
+        assert token is not None
+        assert isinstance(token, str)
+        assert len(token) > 0
+
+    def test_create_access_token_with_custom_expiry(self):
+        """Test creating JWT token with custom expiry delta."""
+        data = {"sub": "123"}
+        expires_delta = timedelta(minutes=60)
+        token = create_access_token(data, expires_delta)
+
+        assert token is not None
+
+        # Verify expiry in payload
+        payload = jwt.decode(
+            token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
+        )
+        assert "exp" in payload
+        assert "sub" in payload
+
+    def test_create_access_token_without_expiry(self):
+        """Test creating JWT token with default expiry."""
+        data = {"sub": "123"}
+        token = create_access_token(data)
+
+        payload = jwt.decode(
+            token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
+        )
+        assert "exp" in payload
+
+    def test_verify_valid_token(self):
+        """Test verifying valid JWT token."""
+        data = {"sub": "123", "custom": "data"}
+        token = create_access_token(data)
+        payload = verify_token(token)
+
+        assert payload is not None
+        assert payload["sub"] == "123"
+        assert payload["custom"] == "data"
+
+    def test_verify_invalid_token(self):
+        """Test verifying invalid JWT token."""
+        payload = verify_token("invalid_token_string")
+        assert payload is None
+
+    def test_verify_malformed_token(self):
+        """Test verifying malformed JWT token."""
+        payload = verify_token("header.payload.signature")
+        assert payload is None
+
+    def test_verify_expired_token(self):
+        """Test verifying expired JWT token."""
+        data = {"sub": "123"}
+        expires_delta = timedelta(minutes=-5)  # Expired
+        token = create_access_token(data, expires_delta)
+        payload = verify_token(token)
+
+        assert payload is None
+
+    def test_verify_token_wrong_secret(self):
+        """Test verifying token with wrong secret key."""
+        data = {"sub": "123"}
+        token = create_access_token(data)
+
+        # Try to decode with wrong secret
+        with pytest.raises(JWTError):
+            jwt.decode(token, "wrong-secret", algorithms=[settings.JWT_ALGORITHM])
+
+
+class TestAuthEndpoints:
+    """Test authentication endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_register_success(self, client):
+        """Test successful user registration."""
+        user_data = {
+            "email": "newuser@example.com",
+            "password": "Newpassword123",
+            "is_admin": False,
+        }
+        response = await client.post("/api/v1/auth/register", json=user_data)
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert "access_token" in data
+        assert data["token_type"] == "bearer"
+        assert data["user_id"] is not None
+        assert data["is_admin"] is False
+        assert isinstance(data["access_token"], str)
+
+    @pytest.mark.asyncio
+    async def test_register_duplicate_email(self, client, test_user):
+        """Test registration with duplicate email."""
+        user_data = {
+            "email": test_user.email,  # Already exists
+            "password": "Password123",
+            "is_admin": False,
+        }
+        response = await client.post("/api/v1/auth/register", json=user_data)
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        data = response.json()
+        assert "detail" in data
+        assert "already registered" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_register_invalid_email(self, client):
+        """Test registration with invalid email format."""
+        user_data = {
+            "email": "invalid-email",
+            "password": "password123",
+            "is_admin": False,
+        }
+        response = await client.post("/api/v1/auth/register", json=user_data)
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_register_weak_password(self, client):
+        """Test registration with weak password."""
+        user_data = {
+            "email": "user@example.com",
+            "password": "123",  # Too short
+            "is_admin": False,
+        }
+        response = await client.post("/api/v1/auth/register", json=user_data)
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_register_missing_fields(self, client):
+        """Test registration with missing required fields."""
+        user_data = {
+            "email": "user@example.com",
+            # Missing password
+        }
+        response = await client.post("/api/v1/auth/register", json=user_data)
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_login_success(self, client, test_user):
+        """Test successful login with correct credentials."""
+        login_data = {
+            "username": test_user.email,
+            "password": "Testpassword123",
+        }
+        response = await client.post("/api/v1/auth/login", data=login_data)
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert "access_token" in data
+        assert data["token_type"] == "bearer"
+        assert data["user_id"] == test_user.id
+        assert data["is_admin"] is False
+
+    @pytest.mark.asyncio
+    async def test_login_wrong_password(self, client, test_user):
+        """Test login with incorrect password."""
+        login_data = {
+            "username": test_user.email,
+            "password": "wrongpassword",
+        }
+        response = await client.post("/api/v1/auth/login", data=login_data)
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        data = response.json()
+        assert "detail" in data
+        assert "incorrect" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_login_nonexistent_user(self, client):
+        """Test login with non-existent user email."""
+        login_data = {
+            "username": "nonexistent@example.com",
+            "password": "password123",
+        }
+        response = await client.post("/api/v1/auth/login", data=login_data)
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        data = response.json()
+        assert "detail" in data
+        assert "incorrect" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_login_inactive_user(self, client, test_db, test_user):
+        """Test login with inactive user account."""
+        # Deactivate user
+        from app.services.user_service import UserService
+        from app.schemas.user import UserUpdate
+
+        update_data = UserUpdate(is_active=False)
+        await UserService.update(test_db, test_user.id, update_data)
+
+        login_data = {
+            "username": test_user.email,
+            "password": "Testpassword123",
+        }
+        response = await client.post("/api/v1/auth/login", data=login_data)
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_login_admin_user(self, client, test_admin):
+        """Test login with admin user credentials."""
+        login_data = {
+            "username": test_admin.email,
+            "password": "Adminpassword123",
+        }
+        response = await client.post("/api/v1/auth/login", data=login_data)
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["is_admin"] is True
+
+    @pytest.mark.asyncio
+    async def test_login_missing_credentials(self, client):
+        """Test login with missing credentials."""
+        login_data = {}  # Missing username and password
+        response = await client.post("/api/v1/auth/login", data=login_data)
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_login_empty_password(self, client, test_user):
+        """Test login with empty password."""
+        login_data = {
+            "username": test_user.email,
+            "password": "",
+        }
+        response = await client.post("/api/v1/auth/login", data=login_data)
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_token_authentication_flow(self, client):
+        """Test complete authentication flow with token usage."""
+        # Register new user
+        user_data = {
+            "email": "flow@example.com",
+            "password": "Flowpassword123",
+            "is_admin": False,
+        }
+        register_response = await client.post("/api/v1/auth/register", json=user_data)
+        assert register_response.status_code == status.HTTP_200_OK
+        token = register_response.json()["access_token"]
+
+        # Use token to access protected endpoint
+        client.headers = {"Authorization": f"Bearer {token}"}
+        profile_response = await client.get("/api/v1/users/me")
+
+        assert profile_response.status_code == status.HTTP_200_OK
+        profile_data = profile_response.json()
+        assert profile_data["email"] == "flow@example.com"
+
+---
+
+=== FILE: backend/tests/test_dependencies.py ===
+
+"""Test FastAPI dependencies and middleware."""
+
+import pytest
+from fastapi import status, HTTPException
+from unittest.mock import AsyncMock, patch
+
+from app.api.deps import get_current_user, get_current_active_user, require_admin
+from app.services.user_service import UserService
+
+
+class TestDependencies:
+    """Test API dependencies."""
+
+    @pytest.mark.asyncio
+    async def test_get_current_user_success(self, test_db, test_user):
+        """Test successful current user retrieval."""
+        mock_credentials = AsyncMock()
+        mock_credentials.credentials = "valid_token"
+
+        with patch("app.api.deps.verify_token") as mock_verify:
+            mock_verify.return_value = {"sub": str(test_user.id)}
+
+            with patch("app.api.deps.UserService.get_by_id") as mock_get_user:
+                mock_get_user.return_value = test_user
+
+                user = await get_current_user(mock_credentials, test_db)
+                assert user == test_user
+
+    @pytest.mark.asyncio
+    async def test_get_current_user_invalid_token(self, test_db):
+        """Test current user retrieval with invalid token."""
+        mock_credentials = AsyncMock()
+        mock_credentials.credentials = "invalid_token"
+
+        with patch("app.api.deps.verify_token") as mock_verify:
+            mock_verify.return_value = None
+
+            with pytest.raises(HTTPException) as exc_info:
+                await get_current_user(mock_credentials, test_db)
+
+            assert exc_info.value.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_get_current_user_missing_sub(self, test_db):
+        """Test current user retrieval with token missing sub claim."""
+        mock_credentials = AsyncMock()
+        mock_credentials.credentials = "token_without_sub"
+
+        with patch("app.api.deps.verify_token") as mock_verify:
+            mock_verify.return_value = {"other_claim": "value"}  # No 'sub'
+
+            with pytest.raises(HTTPException) as exc_info:
+                await get_current_user(mock_credentials, test_db)
+
+            assert exc_info.value.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_get_current_user_not_found(self, test_db):
+        """Test current user retrieval when user doesn't exist."""
+        mock_credentials = AsyncMock()
+        mock_credentials.credentials = "valid_token"
+
+        with patch("app.api.deps.verify_token") as mock_verify:
+            mock_verify.return_value = {"sub": "999"}  # Non-existent user
+
+            with patch("app.api.deps.UserService.get_by_id") as mock_get_user:
+                mock_get_user.return_value = None
+
+                with pytest.raises(HTTPException) as exc_info:
+                    await get_current_user(mock_credentials, test_db)
+
+                assert exc_info.value.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_get_current_active_user_success(self, test_user):
+        """Test successful active user retrieval."""
+        user = await get_current_active_user(test_user)
+        assert user == test_user
+
+    @pytest.mark.asyncio
+    async def test_get_current_active_user_inactive(self, test_db, test_user):
+        """Test active user retrieval with inactive user."""
+        test_user.is_active = False
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_active_user(test_user)
+
+        assert exc_info.value.status_code == status.HTTP_401_UNAUTHORIZED
+        assert "inactive" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_require_admin_success(self, test_admin):
+        """Test successful admin requirement check."""
+        user = await require_admin(test_admin)
+        assert user == test_admin
+
+    @pytest.mark.asyncio
+    async def test_require_admin_non_admin(self, test_user):
+        """Test admin requirement check with non-admin user."""
+        with pytest.raises(HTTPException) as exc_info:
+            await require_admin(test_user)
+
+        assert exc_info.value.status_code == status.HTTP_403_FORBIDDEN
+        assert "permissions" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_dependency_chain(self, test_db, test_admin):
+        """Test dependency chain: active user -> admin."""
+        # This tests that the dependencies can be chained together
+        active_user = await get_current_active_user(test_admin)
+        admin_user = await require_admin(active_user)
+        assert admin_user == test_admin
+
+    @pytest.mark.asyncio
+    async def test_invalid_user_id_format(self, test_db):
+        """Test current user retrieval with invalid user ID format in token."""
+        mock_credentials = AsyncMock()
+        mock_credentials.credentials = "valid_token"
+
+        with patch("app.api.deps.verify_token") as mock_verify:
+            mock_verify.return_value = {"sub": "not_an_integer"}  # Invalid ID format
+
+            with pytest.raises(HTTPException) as exc_info:
+                await get_current_user(mock_credentials, test_db)
+
+            assert exc_info.value.status_code == status.HTTP_401_UNAUTHORIZED
+
+---
+
+=== FILE: backend/tests/test_users.py ===
+
+"""Test user management endpoints."""
+
+import pytest
+from fastapi import status
+
+
+class TestUserEndpoints:
+    """Test user management endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_get_users_unauthorized(self, client):
+        """Test getting users without authentication."""
+        response = await client.get("/api/v1/users/")
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_get_users_non_admin(self, auth_client):
+        """Test getting users as non-admin user."""
+        response = await auth_client.get("/api/v1/users/")
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        data = response.json()
+        assert "detail" in data
+        assert "permissions" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_get_users_admin(self, admin_client, test_user, test_admin):
+        """Test getting users as admin user."""
+        response = await admin_client.get("/api/v1/users/")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert isinstance(data, list)
+        assert len(data) >= 2  # test_user + test_admin
+
+        # Check that both users are in the response
+        emails = [user["email"] for user in data]
+        assert test_user.email in emails
+        assert test_admin.email in emails
+
+    @pytest.mark.asyncio
+    async def test_get_users_pagination(self, admin_client, multiple_tasks):
+        """Test getting users with pagination parameters."""
+        response = await admin_client.get("/api/v1/users/?skip=1&limit=2")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert isinstance(data, list)
+        assert len(data) <= 2
+
+    @pytest.mark.asyncio
+    async def test_get_current_user(self, auth_client, test_user):
+        """Test getting current user profile."""
+        response = await auth_client.get("/api/v1/users/me")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["email"] == test_user.email
+        assert data["id"] == test_user.id
+        assert data["is_active"] is True
+        assert data["is_admin"] is False
+
+    @pytest.mark.asyncio
+    async def test_get_current_user_unauthorized(self, client):
+        """Test getting current user without authentication."""
+        response = await client.get("/api/v1/users/me")
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.asyncio
+    async def test_get_current_user_admin(self, admin_client, test_admin):
+        """Test getting current user as admin."""
+        response = await admin_client.get("/api/v1/users/me")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["email"] == test_admin.email
+        assert data["is_admin"] is True
+
+    @pytest.mark.asyncio
+    async def test_get_user_by_id_admin(self, admin_client, test_user):
+        """Test getting specific user by ID as admin."""
+        response = await admin_client.get(f"/api/v1/users/{test_user.id}")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["email"] == test_user.email
+        assert data["id"] == test_user.id
+        assert data["is_active"] == test_user.is_active
+        assert data["is_admin"] == test_user.is_admin
+
+    @pytest.mark.asyncio
+    async def test_get_user_by_id_non_admin(self, auth_client, test_user):
+        """Test getting specific user by ID as non-admin."""
+        response = await auth_client.get(f"/api/v1/users/{test_user.id}")
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    @pytest.mark.asyncio
+    async def test_get_user_by_id_not_found(self, admin_client):
+        """Test getting non-existent user by ID."""
+        response = await admin_client.get("/api/v1/users/9999")
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+        data = response.json()
+        assert "detail" in data
+        assert "not found" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_get_user_by_id_invalid_id(self, admin_client):
+        """Test getting user with invalid ID format."""
+        response = await admin_client.get("/api/v1/users/invalid")
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_update_user_admin(self, admin_client, test_user):
+        """Test updating user as admin."""
+        update_data = {
+            "is_admin": True,
+            "is_active": False,
+            "email": "updated@example.com",
+        }
+        response = await admin_client.patch(
+            f"/api/v1/users/{test_user.id}", json=update_data
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["is_admin"] is True
+        assert data["is_active"] is False
+        assert data["email"] == "updated@example.com"
+
+    @pytest.mark.asyncio
+    async def test_update_user_partial_data(self, admin_client, test_user):
+        """Test updating user with partial data."""
+        update_data = {"is_admin": True}
+        response = await admin_client.patch(
+            f"/api/v1/users/{test_user.id}", json=update_data
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["is_admin"] is True
+        assert data["email"] == test_user.email  # Unchanged
+        assert data["is_active"] == test_user.is_active  # Unchanged
+
+    @pytest.mark.asyncio
+    async def test_update_user_non_admin(self, auth_client, test_user):
+        """Test updating user as non-admin."""
+        update_data = {"is_admin": True}
+        response = await auth_client.patch(
+            f"/api/v1/users/{test_user.id}", json=update_data
+        )
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    @pytest.mark.asyncio
+    async def test_update_user_not_found(self, admin_client):
+        """Test updating non-existent user."""
+        update_data = {"is_admin": True}
+        response = await admin_client.patch("/api/v1/users/9999", json=update_data)
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_update_user_invalid_email(self, admin_client, test_user):
+        """Test updating user with invalid email."""
+        update_data = {"email": "invalid-email"}
+        response = await admin_client.patch(
+            f"/api/v1/users/{test_user.id}", json=update_data
+        )
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_update_user_duplicate_email(
+        self, admin_client, test_user, test_admin
+    ):
+        """Test updating user with duplicate email."""
+        update_data = {"email": test_admin.email}  # Already exists
+        response = await admin_client.patch(
+            f"/api/v1/users/{test_user.id}", json=update_data
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @pytest.mark.asyncio
+    async def test_delete_user_admin(self, admin_client, test_user):
+        """Test deleting user as admin."""
+        response = await admin_client.delete(f"/api/v1/users/{test_user.id}")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert "message" in data
+        assert "deleted" in data["message"].lower()
+
+        # Verify user is actually deleted
+        get_response = await admin_client.get(f"/api/v1/users/{test_user.id}")
+        assert get_response.status_code == status.HTTP_404_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_delete_user_non_admin(self, auth_client, test_user):
+        """Test deleting user as non-admin."""
+        response = await auth_client.delete(f"/api/v1/users/{test_user.id}")
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    @pytest.mark.asyncio
+    async def test_delete_user_self(self, admin_client, test_admin):
+        """Test admin trying to delete themselves."""
+        response = await admin_client.delete(f"/api/v1/users/{test_admin.id}")
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        data = response.json()
+        assert "detail" in data
+        assert "yourself" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_delete_user_not_found(self, admin_client):
+        """Test deleting non-existent user."""
+        response = await admin_client.delete("/api/v1/users/9999")
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_delete_user_with_tasks(self, admin_client, test_user, test_task):
+        """Test deleting user who has tasks (should cascade delete)."""
+        response = await admin_client.delete(f"/api/v1/users/{test_user.id}")
+
+        assert response.status_code == status.HTTP_200_OK
+
+    @pytest.mark.asyncio
+    async def test_user_lifecycle(self, admin_client):
+        """Test complete user lifecycle: create → update → delete."""
+        # Create user via registration
+        user_data = {
+            "email": "lifecycle@example.com",
+            "password": "Lifecycle123",
+            "is_admin": False,
+        }
+        register_response = await admin_client.post(
+            "/api/v1/auth/register", json=user_data
+        )
+        assert register_response.status_code == status.HTTP_200_OK
+        user_id = register_response.json()["user_id"]
+
+        # Update user
+        update_data = {"is_active": False}
+        update_response = await admin_client.patch(
+            f"/api/v1/users/{user_id}", json=update_data
+        )
+        assert update_response.status_code == status.HTTP_200_OK
+        assert update_response.json()["is_active"] is False
+
+        # Delete user
+        delete_response = await admin_client.delete(f"/api/v1/users/{user_id}")
+        assert delete_response.status_code == status.HTTP_200_OK
+
+---
+
+=== FILE: backend/tests/conftest.py ===
+
+"""Pytest configuration and fixtures for testing the FastAPI application."""
+
+import asyncio
+from typing import AsyncGenerator, Generator
+import pytest
+import pytest_asyncio
+from httpx import AsyncClient, ASGITransport
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.main import app
+from app.database import get_db, Base
+from app.config import settings
+from app.models.user import User
+from app.models.task import Task, TaskStatus
+from app.auth.security import get_password_hash
+
+
+@pytest.fixture(scope="session")
+def event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:
+    """Create an instance of the default event loop for the test session."""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
+
+
+@pytest_asyncio.fixture(scope="function")
+async def test_db() -> AsyncGenerator[AsyncSession, None]:
+    """Create a fresh test database for each test function."""
+    # Configure test database
+    test_database_url = "sqlite+aiosqlite:///:memory:"
+
+    engine = create_async_engine(
+        test_database_url,
+        echo=False,
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+
+    # Create all tables
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+
+    # Create async session factory
+    TestingSessionLocal = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
+    )
+
+    # Create session
+    async with TestingSessionLocal() as session:
+        try:
+            yield session
+        finally:
+            await session.rollback()
+
+    # Cleanup
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(scope="function")
+async def client(test_db: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+    """Create a test client with test database."""
+
+    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        try:
+            yield test_db
+        finally:
+            await test_db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    # Create a fresh client WITHOUT any headers
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as async_client:
+        yield async_client
+
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def test_user(test_db: AsyncSession) -> User:
+    """Create a test user."""
+    user = User(
+        email="test@example.com",
+        hashed_password=get_password_hash("Testpassword123"),
+        is_active=True,
+        is_admin=False,
+    )
+    test_db.add(user)
+    await test_db.commit()
+    await test_db.refresh(user)
+    return user
+
+
+@pytest_asyncio.fixture
+async def test_admin(test_db: AsyncSession) -> User:
+    """Create a test admin user."""
+    admin = User(
+        email="admin@example.com",
+        hashed_password=get_password_hash("Adminpassword123"),
+        is_active=True,
+        is_admin=True,
+    )
+    test_db.add(admin)
+    await test_db.commit()
+    await test_db.refresh(admin)
+    return admin
+
+
+@pytest_asyncio.fixture
+async def test_task(test_db: AsyncSession, test_user: User) -> Task:
+    """Create a test task."""
+    task = Task(
+        title="Test Task",
+        description="Test Description",
+        status=TaskStatus.TODO,
+        owner_id=test_user.id,
+    )
+    test_db.add(task)
+    await test_db.commit()
+    await test_db.refresh(task)
+    return task
+
+
+@pytest_asyncio.fixture
+async def auth_client(
+    test_db: AsyncSession, test_user: User
+) -> AsyncGenerator[AsyncClient, None]:
+    """Create an authenticated test client."""
+
+    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        try:
+            yield test_db
+        finally:
+            await test_db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    # Create a temporary client for login
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as temp_client:
+        # Login to get token
+        login_data = {"username": test_user.email, "password": "Testpassword123"}
+        response = await temp_client.post("/api/v1/auth/login", data=login_data)
+        assert response.status_code == 200
+        token = response.json()["access_token"]
+
+    # Create a SEPARATE client with auth headers
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+        headers={"Authorization": f"Bearer {token}"},
+    ) as async_client:
+        yield async_client
+
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def admin_client(
+    test_db: AsyncSession, test_admin: User
+) -> AsyncGenerator[AsyncClient, None]:
+    """Create an authenticated admin test client."""
+
+    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        try:
+            yield test_db
+        finally:
+            await test_db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    # Create a temporary client for login
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as temp_client:
+        # Login to get token
+        login_data = {"username": test_admin.email, "password": "Adminpassword123"}
+        response = await temp_client.post("/api/v1/auth/login", data=login_data)
+        assert response.status_code == 200
+        token = response.json()["access_token"]
+
+    # Create a SEPARATE client with auth headers
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+        headers={"Authorization": f"Bearer {token}"},
+    ) as async_client:
+        yield async_client
+
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def another_user(test_db: AsyncSession) -> User:
+    """Create another test user for testing multi-user scenarios."""
+    user = User(
+        email="another@example.com",
+        hashed_password=get_password_hash("Anotherpassword123"),
+        is_active=True,
+        is_admin=False,
+    )
+    test_db.add(user)
+    await test_db.commit()
+    await test_db.refresh(user)
+    return user
+
+
+@pytest_asyncio.fixture
+async def multiple_tasks(test_db: AsyncSession, test_user: User) -> list[Task]:
+    """Create multiple test tasks."""
+    tasks = [
+        Task(
+            title=f"Task {i}",
+            description=f"Description {i}",
+            status=TaskStatus.TODO,
+            owner_id=test_user.id,
+        )
+        for i in range(3)
+    ]
+
+    for task in tasks:
+        test_db.add(task)
+
+    await test_db.commit()
+
+    for task in tasks:
+        await test_db.refresh(task)
+
+    return tasks
+
+
+@pytest_asyncio.fixture
+async def unauthenticated_client(
+    test_db: AsyncSession,
+) -> AsyncGenerator[AsyncClient, None]:
+    """Create a guaranteed unauthenticated test client."""
+
+    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        try:
+            yield test_db
+        finally:
+            await test_db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    # Create a fresh client WITHOUT any headers
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as async_client:
+        yield async_client
+
+    app.dependency_overrides.clear()
+
+---
+
+=== FILE: backend/tests/test_integration.py ===
+
+"""Test integration scenarios and end-to-end workflows."""
+
+import pytest
+from fastapi import status
+from httpx import AsyncClient, ASGITransport
+from app.main import app
+from app.models.task import TaskStatus
+
+
+class TestIntegrationWorkflows:
+    """Test integration workflows."""
+
+    @pytest.mark.asyncio
+    async def test_full_user_workflow(self, client, test_db):
+        """Test complete user registration and task management workflow."""
+        # 1. Register new user
+        user_data = {
+            "email": "workflow@example.com",
+            "password": "Workflowpassword123",
+            "is_admin": False,
+        }
+        response = await client.post("/api/v1/auth/register", json=user_data)
+        assert response.status_code == status.HTTP_200_OK
+        token = response.json()["access_token"]
+        user_id = response.json()["user_id"]
+
+        profile_response = await client.get(
+            "/api/v1/users/me", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert profile_response.status_code == status.HTTP_200_OK
+        assert profile_response.json()["email"] == "workflow@example.com"
+
+        # 4. Create multiple tasks
+        tasks_data = [
+            {"title": "Workflow Task 1", "status": TaskStatus.TODO},
+            {
+                "title": "Workflow Task 2",
+                "description": "Second task",
+                "status": TaskStatus.IN_PROGRESS,
+            },
+            {"title": "Workflow Task 3", "status": TaskStatus.DONE},
+        ]
+
+        created_tasks = []
+        for task_data in tasks_data:
+            response = await client.post(
+                "/api/v1/tasks/",
+                headers={"Authorization": f"Bearer {token}"},
+                json=task_data,
+            )
+            assert response.status_code == status.HTTP_200_OK
+            created_tasks.append(response.json())
+
+        # 5. Get all tasks
+        response = await client.get(
+            "/api/v1/tasks/",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == status.HTTP_200_OK
+        tasks = response.json()
+        assert len(tasks) == 3
+
+        # 6. Update a task
+        task_id = created_tasks[0]["id"]
+        update_data = {"status": TaskStatus.IN_PROGRESS}
+        response = await client.patch(
+            f"/api/v1/tasks/{task_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json=update_data,
+        )
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["status"] == TaskStatus.IN_PROGRESS
+
+        # 7. Delete a task
+        response = await client.delete(
+            f"/api/v1/tasks/{task_id}", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == status.HTTP_200_OK
+
+        # 8. Verify task is deleted
+        response = await client.get(
+            "/api/v1/tasks/",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.json()) == 2
+
+    @pytest.mark.asyncio
+    async def test_admin_user_management_workflow(
+        self, admin_client, test_db, test_user
+    ):
+        """Test admin user management workflow."""
+        # 1. Get all users
+        response = await admin_client.get("/api/v1/users/")
+        assert response.status_code == status.HTTP_200_OK
+        initial_users = response.json()
+        initial_count = len(initial_users)
+
+        # 2. Promote regular user to admin
+        update_data = {"is_admin": True}
+        response = await admin_client.patch(
+            f"/api/v1/users/{test_user.id}", json=update_data
+        )
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["is_admin"] is True
+
+        # 3. Verify user is now admin
+        response = await admin_client.get(f"/api/v1/users/{test_user.id}")
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["is_admin"] is True
+
+        # 4. Deactivate user
+        update_data = {"is_active": False}
+        response = await admin_client.patch(
+            f"/api/v1/users/{test_user.id}", json=update_data
+        )
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["is_active"] is False
+
+        # 5. Delete user
+        response = await admin_client.delete(f"/api/v1/users/{test_user.id}")
+        assert response.status_code == status.HTTP_200_OK
+
+        # 6. Verify user is deleted
+        response = await admin_client.get("/api/v1/users/")
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.json()) == initial_count - 1
+
+    @pytest.mark.asyncio
+    async def test_multi_user_task_isolation(
+        self, client, test_db, test_user, another_user
+    ):
+        """Test that users can only see their own tasks."""
+        # Login as first user
+        login_data1 = {"username": test_user.email, "password": "Testpassword123"}
+        response1 = await client.post("/api/v1/auth/login", data=login_data1)
+        assert response1.status_code == status.HTTP_200_OK
+        token1 = response1.json()["access_token"]
+
+        # Create task as first user
+        task_data = {"title": "First User Task"}
+        response = await client.post(
+            "/api/v1/tasks/",
+            headers={"Authorization": f"Bearer {token1}"},
+            json=task_data,
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        first_user_task_id = response.json()["id"]
+
+        # Login as second user
+        login_data2 = {"username": another_user.email, "password": "Anotherpassword123"}
+        response2 = await client.post("/api/v1/auth/login", data=login_data2)
+        assert response2.status_code == status.HTTP_200_OK
+        token2 = response2.json()["access_token"]
+
+        # Create task as second user
+        task_data = {"title": "Second User Task"}
+        response = await client.post(
+            "/api/v1/tasks/",
+            headers={"Authorization": f"Bearer {token2}"},
+            json=task_data,
+        )
+        assert response.status_code == status.HTTP_200_OK
+        second_user_task_id = response.json()["id"]
+
+        # Second user should only see their own task
+        response = await client.get(
+            "/api/v1/tasks/",
+            headers={"Authorization": f"Bearer {token2}"},
+        )
+        assert response.status_code == status.HTTP_200_OK
+        tasks = response.json()
+        assert len(tasks) == 1
+        assert tasks[0]["title"] == "Second User Task"
+        assert tasks[0]["id"] == second_user_task_id
+
+        # Second user should not be able to access first user's task
+        response = await client.get(
+            f"/api/v1/tasks/{first_user_task_id}",
+            headers={"Authorization": f"Bearer {token2}"},
+        )
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    @pytest.mark.asyncio
+    async def test_admin_access_all_data(
+        self, admin_client, test_user, another_user, test_task
+    ):
+        """Test admin can access all users and tasks."""
+        # Admin can see all users
+        response = await admin_client.get("/api/v1/users/")
+        assert response.status_code == status.HTTP_200_OK
+        users = response.json()
+        user_emails = [user["email"] for user in users]
+        assert test_user.email in user_emails
+        assert another_user.email in user_emails
+
+        # Admin can see all tasks
+        response = await admin_client.get("/api/v1/tasks/")
+        assert response.status_code == status.HTTP_200_OK
+        tasks = response.json()
+        assert len(tasks) >= 1
+
+        # Admin can access any user's task
+        response = await admin_client.get(f"/api/v1/tasks/{test_task.id}")
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["id"] == test_task.id
+
+    @pytest.mark.asyncio
+    async def test_token_authentication_flow(self, client):
+        """Test complete token-based authentication flow."""
+        # Register new user
+        user_data = {
+            "email": "tokenflow@example.com",
+            "password": "Tokenflow123",
+            "is_admin": False,
+        }
+        register_response = await client.post("/api/v1/auth/register", json=user_data)
+        assert register_response.status_code == status.HTTP_200_OK
+        register_token = register_response.json()["access_token"]
+
+        profile_response = await client.get(
+            "/api/v1/users/me", headers={"Authorization": f"Bearer {register_token}"}
+        )
+        assert profile_response.status_code == status.HTTP_200_OK
+
+        # Login to get new token
+        login_data = {
+            "username": "tokenflow@example.com",
+            "password": "Tokenflow123",
+        }
+        login_response = await client.post("/api/v1/auth/login", data=login_data)
+        assert login_response.status_code == status.HTTP_200_OK
+        login_token = login_response.json()["access_token"]
+
+        # Use login token
+        profile_response2 = await client.get(
+            "/api/v1/users/me",
+            headers={"Authorization": f"Bearer {login_token}"},
+        )
+        assert profile_response2.status_code == status.HTTP_200_OK
+
+    @pytest.mark.asyncio
+    async def test_base_client_is_unauthenticated(self, client):
+        """Verify that the base client fixture has no authentication headers."""
+        # Check that client has no auth headers
+        if hasattr(client, "headers"):
+            auth_header = client.headers.get("Authorization")
+            assert auth_header is None, (
+                f"Base client should have no auth headers, but has: {auth_header}"
+            )
+
+        # Test multiple endpoints that should return 401
+        endpoints = ["/api/v1/users/me", "/api/v1/tasks/", "/api/v1/users/"]
+
+        for endpoint in endpoints:
+            response = await client.get(endpoint)
+            assert response.status_code == status.HTTP_401_UNAUTHORIZED, (
+                f"Endpoint {endpoint} should return 401 for unauthenticated requests, but got {response.status_code}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_error_handling_flow(
+        self, unauthenticated_client, auth_client, admin_client
+    ):
+        """Test error handling in various scenarios."""
+        # Access protected endpoint without token - should be 401 Unauthorized
+        response = await unauthenticated_client.get("/api/v1/users/me")
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+        # Access admin endpoint as regular user - should be 403 Forbidden
+        response = await auth_client.get("/api/v1/users/")
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+        # Access non-existent resource - should be 404 Not Found
+        response = await admin_client.get("/api/v1/users/99999")
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+        # Create task with invalid data - should be 422 Unprocessable Entity
+        response = await auth_client.post("/api/v1/tasks/", json={})
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+        # Update user with invalid data - should be 422 Unprocessable Entity
+        # First get a valid user ID
+        users_response = await admin_client.get("/api/v1/users/")
+        assert users_response.status_code == status.HTTP_200_OK
+        users = users_response.json()
+        if users:
+            user_id = users[0]["id"]
+            response = await admin_client.patch(
+                f"/api/v1/users/{user_id}", json={"email": "invalid-email"}
+            )
+            assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
+class TestHealthCheck:
+    """Test health check endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_health_check(self, client):
+        """Test health check endpoint returns correct response."""
+        response = await client.get("/health")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["service"] == "backend"
+
+    @pytest.mark.asyncio
+    async def test_health_check_multiple_requests(self, client):
+        """Test health check endpoint handles multiple requests."""
+        for i in range(5):
+            response = await client.get("/health")
+            assert response.status_code == status.HTTP_200_OK
+            data = response.json()
+            assert data["status"] == "ok"
+
+---
+

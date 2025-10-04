@@ -5,23 +5,24 @@ This module provides dependency functions that can be used in route handlers
 to handle JWT authentication, user retrieval, and role-based access control.
 """
 
+from typing import Annotated
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Annotated
 
+from app.models.user import User as UserModel
 from app.database import get_db
 from app.auth.jwt import verify_token
 from app.services.user_service import UserService
 
 # HTTP Bearer security scheme for JWT tokens
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
     db: Annotated[AsyncSession, Depends(get_db)],
-):
+) -> UserModel:
     """
     Dependency to get current authenticated user from JWT token.
 
@@ -40,6 +41,12 @@ async def get_current_user(
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+    if not credentials:
+        raise credentials_exception
+
+    if not credentials.credentials or credentials.credentials.strip() == "":
+        raise credentials_exception
 
     # Verify JWT token
     payload = verify_token(credentials.credentials)
@@ -66,7 +73,7 @@ async def get_current_user(
 
 
 async def get_current_active_user(
-    current_user: Annotated[dict, Depends(get_current_user)],
+    current_user: Annotated[UserModel, Depends(get_current_user)],
 ):
     """
     Dependency to ensure current user is active.
@@ -81,12 +88,15 @@ async def get_current_active_user(
         HTTPException: 400 if user account is inactive
     """
     if not current_user.is_active:
-        raise HTTPException(status_code=400, detail="Inactive user")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Inactive user",
+        )
     return current_user
 
 
 async def require_admin(
-    current_user: Annotated[dict, Depends(get_current_active_user)],
+    current_user: Annotated[UserModel, Depends(get_current_active_user)],
 ):
     """
     Dependency to require admin privileges.

@@ -28,8 +28,19 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
-    is_active = Column(Boolean, default=True)
-    is_admin = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    is_admin = Column(Boolean, default=False, nullable=False)
 
     # Relationship with tasks (one user can have many tasks)
-    tasks = relationship("Task", back_populates="owner", cascade="all, delete-orphan")
+    tasks = relationship(
+        "Task", back_populates="owner", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+    def __init__(self, **kwargs):
+        # Set defaults if not provided
+        kwargs.setdefault("is_active", True)
+        kwargs.setdefault("is_admin", False)
+        super().__init__(**kwargs)
+
+    def __repr__(self):
+        return f"<User(id={self.id}, email={self.email})>"

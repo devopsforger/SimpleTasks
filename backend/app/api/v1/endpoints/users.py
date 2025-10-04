@@ -5,14 +5,16 @@ This module defines the user-related API routes including user CRUD operations
 and profile management. Most endpoints require admin privileges.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Annotated, List
 
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import get_current_active_user, require_admin
 from app.database import get_db
+from app.models.user import User as UserModel
 from app.schemas.user import User, UserUpdate
 from app.services.user_service import UserService
-from app.api.deps import get_current_active_user, require_admin
 
 # Router for user endpoints
 router = APIRouter()
@@ -21,7 +23,7 @@ router = APIRouter()
 @router.get("/", response_model=List[User])
 async def get_users(
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[dict, Depends(require_admin)],
+    current_user: UserModel = Depends(require_admin),
     skip: int = 0,
     limit: int = 100,
 ):
@@ -43,7 +45,7 @@ async def get_users(
 
 @router.get("/me", response_model=User)
 async def get_current_user(
-    current_user: Annotated[dict, Depends(get_current_active_user)],
+    current_user: UserModel = Depends(get_current_active_user),
 ):
     """
     Get current user's profile.
@@ -61,7 +63,7 @@ async def get_current_user(
 async def get_user(
     user_id: int,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[dict, Depends(require_admin)],
+    current_user: UserModel = Depends(require_admin),
 ):
     """
     Get specific user by ID (admin only).
@@ -90,7 +92,7 @@ async def update_user(
     user_id: int,
     user_update: UserUpdate,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[dict, Depends(require_admin)],
+    current_user: UserModel = Depends(require_admin),
 ):
     """
     Update user information (admin only).
@@ -106,20 +108,30 @@ async def update_user(
 
     Raises:
         HTTPException: 404 if user not found
+        HTTPException: 400 if email already exists
     """
-    user = await UserService.update(db, user_id, user_update)
-    if not user:
+    try:
+        user = await UserService.update(db, user_id, user_update)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+            )
+        return user
+    except ValueError as e:
+        if "already exists" in str(e):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+            ) from e
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
-        )
-    return user
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        ) from e
 
 
 @router.delete("/{user_id}")
 async def delete_user(
     user_id: int,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[dict, Depends(require_admin)],
+    current_user: UserModel = Depends(require_admin),
 ):
     """
     Delete user (admin only).
