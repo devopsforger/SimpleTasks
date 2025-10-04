@@ -154,3 +154,8 @@ ENV/
 dist/ 
 build/ 
 *.egg-info/
+.coverage
+htmlcov/
+combine.sh
+combined _project.txt
+.pytest_cache/
